@@ -8,7 +8,28 @@
 </head>
 <body>
   <canvas id="c"></canvas>
+
   <div id="hint">Drag to select &middot; Esc to cancel</div>
+  <div id="sizebadge"></div>
+
+  <div id="toolbar" class="panel">
+    <button class="tool" data-tool="pen"    title="Pen">&#9998;</button>
+    <button class="tool" data-tool="line"   title="Line">&#8260;</button>
+    <button class="tool" data-tool="arrow"  title="Arrow">&#8599;</button>
+    <button class="tool" data-tool="rect"   title="Rectangle">&#9645;</button>
+    <button class="tool" data-tool="marker" title="Marker">&#9647;</button>
+    <button class="tool" data-tool="text"   title="Text">T</button>
+    <button class="tool" data-tool="blur"   title="Blur">&#9685;</button>
+    <button class="tool" id="undoBtn" title="Undo (Ctrl+Z)">&#8630;</button>
+    <div class="swatches" id="swatches"></div>
+  </div>
+
+  <div id="actionbar" class="panel">
+    <button id="copyBtn" title="Copy (Ctrl+C)">Copy</button>
+    <button id="saveBtn" title="Save (Ctrl+S)">Save</button>
+    <button id="closeBtn" title="Close (Esc)">&#10005;</button>
+  </div>
+
   <script src="overlay.js"></script>
 </body>
 </html>

@@ -5,10 +5,14 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl,
+    WebviewWindowBuilder,
+};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 // ---------- logging ----------
@@ -81,10 +85,18 @@ fn store_settings(s: &Settings) -> Result<(), String> {
     fs::write(settings_path(), json).map_err(|e| e.to_string())
 }
 
+#[derive(Serialize, Clone)]
+struct FrozenShot {
+    data_url: String,
+    width: u32,
+    height: u32,
+}
+
 struct AppState {
     settings: Mutex<Settings>,
     area_sc: Mutex<Option<Shortcut>>,
     full_sc: Mutex<Option<Shortcut>>,
+    frozen: Mutex<Option<FrozenShot>>,
 }
 
 fn resolve_save_dir(state: &AppState) -> PathBuf {
@@ -131,34 +143,54 @@ fn capture_full(dir: &PathBuf) -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
-fn capture_region(dir: &PathBuf, x: i32, y: i32, w: u32, h: u32) -> Result<String, String> {
+fn grab_frozen() -> Result<FrozenShot, String> {
     let monitor = primary_monitor()?;
     let image = monitor
         .capture_image()
         .map_err(|e| format!("capture_image failed: {e}"))?;
-    let (iw, ih) = (image.width(), image.height());
-    let x = x.max(0) as u32;
-    let y = y.max(0) as u32;
-    if x >= iw || y >= ih {
-        return Err(format!("selection out of bounds: {x},{y} on {iw}x{ih}"));
-    }
-    let w = w.min(iw - x).max(1);
-    let h = h.min(ih - y).max(1);
-    let cropped = image::imageops::crop_imm(&image, x, y, w, h).to_image();
-    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let path = dir.join(timestamp_name());
-    cropped
-        .save(&path)
-        .map_err(|e| format!("save failed: {e}"))?;
-    Ok(path.to_string_lossy().to_string())
+    let (width, height) = (image.width(), image.height());
+    let dynimg = image::DynamicImage::ImageRgba8(image);
+    let mut buf = std::io::Cursor::new(Vec::new());
+    dynimg
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .map_err(|e| format!("png encode failed: {e}"))?;
+    let b64 = STANDARD.encode(buf.into_inner());
+    Ok(FrozenShot {
+        data_url: format!("data:image/png;base64,{b64}"),
+        width,
+        height,
+    })
+}
+
+fn decode_png_data_url(s: &str) -> Result<Vec<u8>, String> {
+    let data = s
+        .rsplit_once(",")
+        .map(|(_, b)| b)
+        .unwrap_or(s);
+    STANDARD.decode(data).map_err(|e| format!("base64 decode failed: {e}"))
 }
 
 // ---------- windows ----------
+
+fn begin_area_capture(app: &AppHandle) {
+    match grab_frozen() {
+        Ok(shot) => {
+            *app.state::<AppState>().frozen.lock().unwrap() = Some(shot);
+            log("screen frozen for area capture");
+        }
+        Err(e) => {
+            log(&format!("freeze failed: {e}"));
+            return;
+        }
+    }
+    show_overlay(app);
+}
 
 fn show_overlay(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("overlay") {
         let _ = w.show();
         let _ = w.set_focus();
+        let _ = w.emit("frozen-ready", ());
         return;
     }
     let handle = app.clone();
@@ -184,6 +216,7 @@ fn show_overlay(app: &AppHandle) {
                 }
                 let _ = win.show();
                 let _ = win.set_focus();
+                let _ = win.emit("frozen-ready", ());
                 log("overlay opened");
             }
             Err(e) => log(&format!("overlay build failed: {e}")),
@@ -191,10 +224,11 @@ fn show_overlay(app: &AppHandle) {
     });
 }
 
-fn close_overlay(app: &AppHandle) {
+fn hide_overlay(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("overlay") {
-        let _ = w.close();
+        let _ = w.hide();
     }
+    *app.state::<AppState>().frozen.lock().unwrap() = None;
 }
 
 fn show_settings(app: &AppHandle) {
@@ -281,26 +315,46 @@ fn save_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> 
 }
 
 #[tauri::command]
-fn area_selected(app: AppHandle, x: i32, y: i32, width: u32, height: u32) -> Result<String, String> {
-    log(&format!("area selected: x={x} y={y} w={width} h={height}"));
-    close_overlay(&app);
+fn get_frozen(state: State<AppState>) -> Option<FrozenShot> {
+    state.frozen.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn save_capture(app: AppHandle, png_data_url: String) -> Result<String, String> {
+    let bytes = decode_png_data_url(&png_data_url)?;
     let dir = resolve_save_dir(&app.state::<AppState>());
-    match capture_region(&dir, x, y, width, height) {
-        Ok(p) => {
-            log(&format!("saved area screenshot: {p}"));
-            Ok(p)
-        }
-        Err(e) => {
-            log(&format!("area capture error: {e}"));
-            Err(e)
-        }
-    }
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(timestamp_name());
+    fs::write(&path, &bytes).map_err(|e| format!("save failed: {e}"))?;
+    let p = path.to_string_lossy().to_string();
+    log(&format!("saved area screenshot: {p}"));
+    hide_overlay(&app);
+    Ok(p)
+}
+
+#[tauri::command]
+fn copy_capture(app: AppHandle, png_data_url: String) -> Result<(), String> {
+    let bytes = decode_png_data_url(&png_data_url)?;
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| format!("decode failed: {e}"))?
+        .to_rgba8();
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let mut cb = arboard::Clipboard::new().map_err(|e| format!("clipboard open failed: {e}"))?;
+    cb.set_image(arboard::ImageData {
+        width: w,
+        height: h,
+        bytes: std::borrow::Cow::Owned(img.into_raw()),
+    })
+    .map_err(|e| format!("clipboard write failed: {e}"))?;
+    log("copied area screenshot to clipboard");
+    hide_overlay(&app);
+    Ok(())
 }
 
 #[tauri::command]
 fn cancel_area(app: AppHandle) {
     log("area selection cancelled");
-    close_overlay(&app);
+    hide_overlay(&app);
 }
 
 #[tauri::command]
@@ -335,7 +389,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("Lightshot We Deserve")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "area" => show_overlay(app),
+            "area" => begin_area_capture(app),
             "full" => do_full_capture(app),
             "settings" => show_settings(app),
             "quit" => {
@@ -381,7 +435,7 @@ fn run() {
                         .unwrap_or(false);
                     if is_area {
                         log("hotkey: capture area");
-                        show_overlay(app);
+                        begin_area_capture(app);
                     } else if is_full {
                         log("hotkey: capture full");
                         do_full_capture(app);
@@ -396,7 +450,9 @@ fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
-            area_selected,
+            get_frozen,
+            save_capture,
+            copy_capture,
             cancel_area,
             capture_full_now,
             close_settings
@@ -407,6 +463,7 @@ fn run() {
                 settings: Mutex::new(load_settings()),
                 area_sc: Mutex::new(None),
                 full_sc: Mutex::new(None),
+                frozen: Mutex::new(None),
             });
             apply_shortcuts(&handle);
             if let Err(e) = build_tray(&handle) {

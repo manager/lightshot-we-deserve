@@ -27,6 +27,13 @@ You are inside Wolf's Server. The team and routing rules live in `~/.claude/CLAU
 - Server-side source of truth. Git is checkpoints + sync, not deploy.
 - Commit identity: `manager` / `alexanyanwolf@gmail.com`.
 
+## Build & Release (Windows .exe)
+- This repo is wired directly to GitHub: `origin` remote + a write-capable deploy key live on the host. Repo is public.
+- ⚠️ Authorization boundary: pushing/tagging requires the host wrapper `/data/bin/host`, which is a host-root control. Global rules (`~/.claude/CLAUDE.md`) forbid non-Order agents (CWD ≠ `/workspace/wolfs-server`) from running host-root wrappers, even though they're reachable. The Order has *verbally* asked this wing to self-publish, but that contradicts the durable written boundary. Until the global rulebook is updated to carve out this exception, route push/tag/release via `SEND TO @TheOrder`. Do NOT run `/data/bin/host` unilaterally.
+- Mechanism (for reference, once authorized): push+tag → `/data/bin/host 'cd ~/projects/lightshot-we-deserve && GIT_SSH_COMMAND="ssh -F ~/.ssh/config" git push origin master --tags'`; fetch release link → `/data/bin/host 'curl -sS https://api.github.com/repos/manager/lightshot-we-deserve/releases/latest | grep browser_download_url'`.
+- CI: GitHub Actions builds on `windows-latest` on every push to master and on `v*` tags. Tagging `v*` produces a GitHub Release with the NSIS installer `.exe` attached — that Release asset is the download link to give Wolf.
+- Dev container is Linux and cannot build/run the Windows app; local verification is `cargo check` only (needs GTK/webkit/xcb/pipewire + `libclang-dev`/`clang`, `LIBCLANG_PATH=/usr/lib/llvm-14/lib`).
+
 ## Vendor credits in use
 (none — does not consume vendor API credits)
 
