@@ -1,0 +1,106 @@
+/* Design defaults — baked into every UI stack scaffolded by new-project.
+   Typography ≥12px · ≤4 sizes · ≤3 weights · ≤2 families.
+   Spacing 4/8 grid · mobile-first breakpoints · WCAG AA contrast. */
+
+:root {
+  /* Font families (2 max — one display, one system). */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+  /* Sizes (4 max). */
+  --fs-sm: 12px;
+  --fs-base: 14px;
+  --fs-lg: 17px;
+  --fs-title: 22px;
+
+  /* Weights (3 max). */
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-bold: 700;
+
+  /* Spacing — 4 / 8 grid. */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-12: 48px;
+
+  /* Color tokens. */
+  --bg: #ffffff;
+  --surface: #f7f7f8;
+  --text: #111315;
+  --muted: #6b7280;
+  --primary: #2563eb;
+  --danger: #dc2626;
+  --success: #16a34a;
+  --border: #e5e7eb;
+
+  /* Radius + shadow. */
+  --r-sm: 4px;
+  --r: 8px;
+  --r-lg: 12px;
+
+  --focus: 0 0 0 3px rgba(37, 99, 235, 0.35);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b0d10;
+    --surface: #14171c;
+    --text: #e7e9ee;
+    --muted: #9099a8;
+    --primary: #60a5fa;
+    --border: #232830;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-regular);
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3 { font-weight: var(--fw-bold); margin: 0 0 var(--sp-3); }
+h1 { font-size: var(--fs-title); }
+h2 { font-size: var(--fs-lg); }
+h3 { font-size: var(--fs-base); }
+
+a { color: var(--primary); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+button, input, textarea, select {
+  font-family: inherit;
+  font-size: var(--fs-base);
+}
+
+:focus-visible { outline: none; box-shadow: var(--focus); border-radius: var(--r-sm); }
+
+img { max-width: 100%; height: auto; }
+
+.container {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: var(--sp-6) var(--sp-4);
+}
+
+/* Mobile-first breakpoints. */
+@media (min-width: 768px)  { .container { padding-inline: var(--sp-6); } }
+@media (min-width: 1024px) { .container { padding-inline: var(--sp-8); } }
+
+/* Loading + empty states. */
+.empty, .loading {
+  text-align: center;
+  color: var(--muted);
+  padding: var(--sp-12) var(--sp-4);
+}

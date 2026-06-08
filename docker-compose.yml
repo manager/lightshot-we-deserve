@@ -1,0 +1,23 @@
+services:
+  lightshot-we-deserve:
+    build: .
+    container_name: lightshot-we-deserve
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5041:80"
+    volumes:
+      # Live edit: drop files into public/ on disk, refresh — no rebuild.
+      # Image still bakes a copy (Dockerfile COPY) so it runs standalone too.
+      - ./public:/usr/share/nginx/html:ro
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+networks:
+  default:
+    external: true
+    name: wolf-shared
