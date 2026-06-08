@@ -394,7 +394,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             "settings" => show_settings(app),
             "quit" => {
                 log("quit requested from tray");
-                app.exit(0);
+                std::process::exit(0);
             }
             _ => {}
         });

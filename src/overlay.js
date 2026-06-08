@@ -27,10 +27,20 @@ let current = null;        // in-progress annotation
 let selecting = false, drawing = false, selStart = null;
 let textInput = null, textPos = null;
 let badgeTimer = null;
+let ready = false;
 
 // ---------- frozen image ----------
 
+function clearCanvasHard() {
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.restore();
+}
+
 async function loadFrozen() {
+  ready = false;
+  clearCanvasHard();           // wipe any leftover frame from a previous capture
   let shot;
   try { shot = await invoke("get_frozen"); } catch (_) { return; }
   if (!shot) return;
@@ -42,6 +52,7 @@ async function loadFrozen() {
   frozenNatW = shot.width;
   frozenNatH = shot.height;
   resetState();
+  ready = true;
   resize();
 }
 
@@ -85,9 +96,8 @@ function normRect(ax, ay, bx, by) {
 
 function render() {
   ctx.clearRect(0, 0, cssW, cssH);
-  if (frozenImg.complete && frozenNatW) {
-    ctx.drawImage(frozenImg, 0, 0, cssW, cssH);
-  }
+  if (!ready || !frozenImg.complete || !frozenNatW) return;
+  ctx.drawImage(frozenImg, 0, 0, cssW, cssH);
   ctx.fillStyle = "rgba(0,0,0,0.45)";
   ctx.fillRect(0, 0, cssW, cssH);
 
@@ -132,26 +142,30 @@ function drawOne(g, a) {
     for (let i = 1; i < p.length; i++) g.lineTo(p[i].x, p[i].y);
     if (p.length === 1) g.lineTo(p[0].x + 0.1, p[0].y);
     g.stroke();
-  } else if (a.type === "line" || a.type === "arrow") {
+  } else if (a.type === "line") {
     g.strokeStyle = a.color;
-    g.fillStyle = a.color;
     g.lineWidth = a.size;
     g.lineCap = "round";
     g.beginPath();
     g.moveTo(a.x1, a.y1);
     g.lineTo(a.x2, a.y2);
     g.stroke();
-    if (a.type === "arrow") drawArrowHead(g, a);
+  } else if (a.type === "arrow") {
+    drawArrow(g, a);
   } else if (a.type === "rect") {
     g.strokeStyle = a.color;
     g.lineWidth = a.size;
     g.strokeRect(a.x, a.y, a.w, a.h);
   } else if (a.type === "blur") {
     g.beginPath();
-    g.rect(a.x, a.y, a.w, a.h);
+    const r = Math.max(4, a.size);
+    for (const p of a.points) {
+      g.moveTo(p.x + r, p.y);
+      g.arc(p.x, p.y, r, 0, Math.PI * 2);
+    }
     g.clip();
-    g.filter = `blur(${Math.max(2, a.size)}px)`;
-    g.drawImage(frozenImg, a.x * sx, a.y * sy, a.w * sx, a.h * sy, a.x, a.y, a.w, a.h);
+    g.filter = `blur(${Math.max(4, r * 0.8)}px)`;
+    g.drawImage(g.canvas, 0, 0, cssW, cssH);
   } else if (a.type === "text") {
     g.fillStyle = a.color;
     g.textBaseline = "top";
@@ -161,13 +175,34 @@ function drawOne(g, a) {
   g.restore();
 }
 
-function drawArrowHead(g, a) {
-  const ang = Math.atan2(a.y2 - a.y1, a.x2 - a.x1);
-  const len = Math.max(12, a.size * 3.2);
+function drawArrow(g, a) {
+  const dx = a.x2 - a.x1, dy = a.y2 - a.y1;
+  const len = Math.hypot(dx, dy);
+  if (len < 0.5) return;
+  const ang = Math.atan2(dy, dx);
+  // Head scales with line width but is capped to the arrow length so big
+  // arrows stay proportional instead of turning into a giant blob.
+  const headLen = Math.min(len * 0.6, Math.max(10, a.size * 4));
+  const headW = headLen * 0.62;
+  const bx = a.x2 - headLen * Math.cos(ang);  // shaft stops where head starts
+  const by = a.y2 - headLen * Math.sin(ang);
+  const px = -Math.sin(ang), py = Math.cos(ang); // unit perpendicular
+
+  g.strokeStyle = a.color;
+  g.fillStyle = a.color;
+  g.lineWidth = a.size;
+  g.lineCap = "round";
+  g.lineJoin = "round";
+
+  g.beginPath();
+  g.moveTo(a.x1, a.y1);
+  g.lineTo(bx, by);
+  g.stroke();
+
   g.beginPath();
   g.moveTo(a.x2, a.y2);
-  g.lineTo(a.x2 - len * Math.cos(ang - Math.PI / 6), a.y2 - len * Math.sin(ang - Math.PI / 6));
-  g.lineTo(a.x2 - len * Math.cos(ang + Math.PI / 6), a.y2 - len * Math.sin(ang + Math.PI / 6));
+  g.lineTo(bx + px * headW / 2, by + py * headW / 2);
+  g.lineTo(bx - px * headW / 2, by - py * headW / 2);
   g.closePath();
   g.fill();
 }
@@ -213,7 +248,7 @@ function setTool(t) {
 }
 
 function positionUI() {
-  if (!sel) {
+  if (!sel || selecting) {
     toolbar.classList.remove("show");
     actionbar.classList.remove("show");
     return;
@@ -328,11 +363,11 @@ canvas.addEventListener("mousedown", (e) => {
   if (tool === "text") { startText(pt); return; }
 
   drawing = true;
-  if (tool === "pen" || tool === "marker") {
+  if (tool === "pen" || tool === "marker" || tool === "blur") {
     current = { type: tool, color, size: sizes[tool], points: [pt] };
   } else if (tool === "line" || tool === "arrow") {
     current = { type: tool, color, size: sizes[tool], x1: pt.x, y1: pt.y, x2: pt.x, y2: pt.y };
-  } else if (tool === "rect" || tool === "blur") {
+  } else if (tool === "rect") {
     current = { type: tool, color, size: sizes[tool], ox: pt.x, oy: pt.y, x: pt.x, y: pt.y, w: 0, h: 0 };
   }
   render();
@@ -346,11 +381,11 @@ window.addEventListener("mousemove", (e) => {
     return;
   }
   if (drawing && current) {
-    if (current.type === "pen" || current.type === "marker") {
+    if (current.type === "pen" || current.type === "marker" || current.type === "blur") {
       current.points.push(pt);
     } else if (current.type === "line" || current.type === "arrow") {
       current.x2 = pt.x; current.y2 = pt.y;
-    } else if (current.type === "rect" || current.type === "blur") {
+    } else if (current.type === "rect") {
       const r = normRect(current.ox, current.oy, pt.x, pt.y);
       current.x = r.x; current.y = r.y; current.w = r.w; current.h = r.h;
     }
@@ -373,7 +408,7 @@ window.addEventListener("mouseup", () => {
     drawing = false;
     const a = current;
     current = null;
-    const big = (a.type === "rect" || a.type === "blur") ? (a.w > 3 && a.h > 3) : true;
+    const big = (a.type === "rect") ? (a.w > 3 && a.h > 3) : true;
     const longEnough = (a.type === "line" || a.type === "arrow")
       ? Math.hypot(a.x2 - a.x1, a.y2 - a.y1) > 3 : true;
     if (big && longEnough) pushAnnotation(a);
@@ -420,18 +455,27 @@ document.getElementById("closeBtn").addEventListener("click", cancel);
 );
 
 function exportPNG() {
+  // Render the WHOLE screen at physical resolution first, then crop the
+  // selection. The blur tool samples its own canvas (drawImage(canvas,...)),
+  // so it needs the full frozen image present to sample from — a pre-cropped
+  // canvas would blur from empty pixels.
+  const full = document.createElement("canvas");
+  full.width = frozenNatW;
+  full.height = frozenNatH;
+  const fx = full.getContext("2d");
+  fx.drawImage(frozenImg, 0, 0, frozenNatW, frozenNatH);
+  fx.save();
+  fx.scale(sx, sy);            // annotations are stored in css px
+  drawAnnotations(fx, committed.concat(undoable));
+  fx.restore();
+
   const w = Math.max(1, Math.round(sel.w * sx));
   const h = Math.max(1, Math.round(sel.h * sy));
   const ec = document.createElement("canvas");
   ec.width = w;
   ec.height = h;
   const ex = ec.getContext("2d");
-  ex.drawImage(frozenImg, sel.x * sx, sel.y * sy, sel.w * sx, sel.h * sy, 0, 0, w, h);
-  ex.save();
-  ex.scale(sx, sy);
-  ex.translate(-sel.x, -sel.y);
-  drawAnnotations(ex, committed.concat(undoable));
-  ex.restore();
+  ex.drawImage(full, Math.round(sel.x * sx), Math.round(sel.y * sy), w, h, 0, 0, w, h);
   return ec.toDataURL("image/png");
 }
 
@@ -464,12 +508,12 @@ function cancel() {
 
 window.addEventListener("keydown", (e) => {
   if (textInput) return; // textarea handles its own keys
-  if (e.key === "Escape") { e.preventDefault(); cancel(); return; }
+  if (e.key === "Escape" || e.code === "Escape") { e.preventDefault(); cancel(); return; }
   if (e.ctrlKey || e.metaKey) {
-    const k = e.key.toLowerCase();
-    if (k === "z") { e.preventDefault(); undo(); }
-    else if (k === "s") { e.preventDefault(); doSave(); }
-    else if (k === "c") { e.preventDefault(); doCopy(); }
+    // Use physical key codes so shortcuts work regardless of layout (e.g. RU).
+    if (e.code === "KeyZ") { e.preventDefault(); undo(); }
+    else if (e.code === "KeyS") { e.preventDefault(); doSave(); }
+    else if (e.code === "KeyC") { e.preventDefault(); doCopy(); }
   }
 });
 

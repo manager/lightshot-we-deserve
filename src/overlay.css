@@ -53,7 +53,7 @@ html, body {
 #toolbar {
   flex-direction: column;
   gap: 2px;
-  width: 38px;
+  width: 48px;
   align-items: center;
 }
 #toolbar.show { display: flex; }
@@ -84,9 +84,9 @@ html, body {
   border-top: 1px solid #444;
 }
 .swatches .sw {
-  width: 13px;
-  height: 13px;
-  border-radius: 3px;
+  width: 19px;
+  height: 19px;
+  border-radius: 4px;
   cursor: pointer;
   border: 1px solid rgba(255,255,255,0.25);
   box-sizing: border-box;
