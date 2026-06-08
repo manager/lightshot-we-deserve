@@ -1,0 +1,27 @@
+[package]
+name = "lightshot-we-deserve"
+version = "0.1.0"
+description = "The Lightshot we deserve - a clean screenshot tool"
+authors = ["manager <alexanyanwolf@gmail.com>"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xcap = "0.9"
+image = "0.25"
+chrono = "0.4"
+dirs = "5"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

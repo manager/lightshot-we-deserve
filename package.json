@@ -1,0 +1,14 @@
+{
+  "name": "lightshot-we-deserve",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "icons": "node scripts/gen-icon.mjs",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
