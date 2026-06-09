@@ -92,11 +92,12 @@ fn store_settings(s: &Settings) -> Result<(), String> {
     fs::write(settings_path(), json).map_err(|e| e.to_string())
 }
 
-// Frozen screen kept in memory as raw PNG bytes. Served to the overlay via a
-// custom URI scheme so the multi-MB image never crosses the JSON IPC bridge
-// (base64 + giant-string transfer was the capture-latency culprit).
+// Frozen screen kept in memory as uncompressed BMP bytes. Served to the overlay
+// via a custom URI scheme so the multi-MB image never crosses the JSON IPC bridge
+// (base64 + giant-string transfer was the capture-latency culprit). BMP skips the
+// PNG compression pass entirely — lossless and faster to encode.
 struct Frozen {
-    png: Vec<u8>,
+    bytes: Vec<u8>,
     width: u32,
     height: u32,
     nonce: u64,
@@ -206,23 +207,18 @@ fn grab_frozen() -> Result<Frozen, String> {
         }
     }
 
-    // Fast PNG (low compression, no filter): the blob is only displayed in the
-    // overlay, so encode speed matters far more than file size.
+    // Uncompressed BMP: the blob is only displayed in the overlay, so we skip the
+    // PNG compression pass entirely — lossless and the fastest encode available.
     let mut buf = std::io::Cursor::new(Vec::new());
-    let encoder = image::codecs::png::PngEncoder::new_with_quality(
-        &mut buf,
-        image::codecs::png::CompressionType::Fast,
-        image::codecs::png::FilterType::NoFilter,
-    );
     {
         use image::ImageEncoder;
-        encoder
+        image::codecs::bmp::BmpEncoder::new(&mut buf)
             .write_image(canvas.as_raw(), vw, vh, image::ExtendedColorType::Rgba8)
-            .map_err(|e| format!("png encode failed: {e}"))?;
+            .map_err(|e| format!("bmp encode failed: {e}"))?;
     }
     log(&format!("frozen virtual desktop {vw}x{vh} at ({min_x},{min_y})"));
     Ok(Frozen {
-        png: buf.into_inner(),
+        bytes: buf.into_inner(),
         width: vw,
         height: vh,
         nonce: next_nonce(),
@@ -402,7 +398,7 @@ fn save_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> 
 fn get_frozen(state: State<AppState>) -> Option<FrozenInfo> {
     let guard = state.frozen.lock().unwrap();
     guard.as_ref().map(|f| FrozenInfo {
-        url: format!("http://frozen.localhost/{}.png", f.nonce),
+        url: format!("http://frozen.localhost/{}.bmp", f.nonce),
         width: f.width,
         height: f.height,
     })
@@ -515,10 +511,10 @@ fn run() {
             let frozen = guard.frozen.lock().unwrap();
             match frozen.as_ref() {
                 Some(f) => tauri::http::Response::builder()
-                    .header("Content-Type", "image/png")
+                    .header("Content-Type", "image/bmp")
                     .header("Cache-Control", "no-store")
                     .header("Access-Control-Allow-Origin", "*")
-                    .body(f.png.clone())
+                    .body(f.bytes.clone())
                     .unwrap(),
                 None => tauri::http::Response::builder()
                     .status(404)
