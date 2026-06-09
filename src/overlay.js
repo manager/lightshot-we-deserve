@@ -47,7 +47,8 @@ async function loadFrozen() {
   await new Promise((res) => {
     frozenImg.onload = res;
     frozenImg.onerror = res;
-    frozenImg.src = shot.data_url;
+    frozenImg.crossOrigin = "anonymous"; // keep the canvas untainted for export
+    frozenImg.src = shot.url;
   });
   frozenNatW = shot.width;
   frozenNatH = shot.height;

@@ -92,9 +92,19 @@ fn store_settings(s: &Settings) -> Result<(), String> {
     fs::write(settings_path(), json).map_err(|e| e.to_string())
 }
 
+// Frozen screen kept in memory as raw PNG bytes. Served to the overlay via a
+// custom URI scheme so the multi-MB image never crosses the JSON IPC bridge
+// (base64 + giant-string transfer was the capture-latency culprit).
+struct Frozen {
+    png: Vec<u8>,
+    width: u32,
+    height: u32,
+    nonce: u64,
+}
+
 #[derive(Serialize, Clone)]
-struct FrozenShot {
-    data_url: String,
+struct FrozenInfo {
+    url: String,
     width: u32,
     height: u32,
 }
@@ -103,7 +113,7 @@ struct AppState {
     settings: Mutex<Settings>,
     area_sc: Mutex<Option<Shortcut>>,
     full_sc: Mutex<Option<Shortcut>>,
-    frozen: Mutex<Option<FrozenShot>>,
+    frozen: Mutex<Option<Frozen>>,
 }
 
 fn resolve_save_dir(state: &AppState) -> PathBuf {
@@ -172,24 +182,47 @@ fn capture_full(dir: &PathBuf) -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
-fn grab_frozen() -> Result<FrozenShot, String> {
+fn next_nonce() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn grab_frozen() -> Result<Frozen, String> {
     let (min_x, min_y, vw, vh) = virtual_bounds()?;
     let monitors = xcap::Monitor::all().map_err(|e| format!("Monitor::all failed: {e}"))?;
+
+    // Capture every monitor in parallel — on multi-monitor setups the per-screen
+    // grabs dominate latency, so we don't want them serialized.
+    let shots: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = monitors
+            .iter()
+            .map(|m| {
+                s.spawn(move || {
+                    let x = m.x().unwrap_or(0);
+                    let y = m.y().unwrap_or(0);
+                    match m.capture_image() {
+                        Ok(img) => Some((x, y, img)),
+                        Err(e) => {
+                            log(&format!("monitor capture failed at ({x},{y}): {e}"));
+                            None
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
+    });
+
     let mut canvas = image::RgbaImage::new(vw, vh);
-    for m in &monitors {
-        let x = m.x().map_err(|e| e.to_string())?;
-        let y = m.y().map_err(|e| e.to_string())?;
-        match m.capture_image() {
-            Ok(img) => {
-                image::imageops::replace(&mut canvas, &img, (x - min_x) as i64, (y - min_y) as i64);
-            }
-            Err(e) => log(&format!("monitor capture failed at ({x},{y}): {e}")),
-        }
+    for (x, y, img) in shots {
+        image::imageops::replace(&mut canvas, &img, (x - min_x) as i64, (y - min_y) as i64);
     }
-    log(&format!("frozen virtual desktop {vw}x{vh} at ({min_x},{min_y})"));
-    // Fast PNG: this image is only shown in the overlay for selection, so we
-    // trade a bigger in-memory blob for a much quicker encode (default zlib
-    // compression on a multi-monitor image cost seconds).
+
+    // Fast PNG (low compression, no filter): the blob is only displayed in the
+    // overlay, so encode speed matters far more than file size.
     let mut buf = std::io::Cursor::new(Vec::new());
     let encoder = image::codecs::png::PngEncoder::new_with_quality(
         &mut buf,
@@ -202,11 +235,12 @@ fn grab_frozen() -> Result<FrozenShot, String> {
             .write_image(canvas.as_raw(), vw, vh, image::ExtendedColorType::Rgba8)
             .map_err(|e| format!("png encode failed: {e}"))?;
     }
-    let b64 = STANDARD.encode(buf.into_inner());
-    Ok(FrozenShot {
-        data_url: format!("data:image/png;base64,{b64}"),
+    log(&format!("frozen virtual desktop {vw}x{vh} at ({min_x},{min_y})"));
+    Ok(Frozen {
+        png: buf.into_inner(),
         width: vw,
         height: vh,
+        nonce: next_nonce(),
     })
 }
 
@@ -380,8 +414,13 @@ fn save_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> 
 }
 
 #[tauri::command]
-fn get_frozen(state: State<AppState>) -> Option<FrozenShot> {
-    state.frozen.lock().unwrap().clone()
+fn get_frozen(state: State<AppState>) -> Option<FrozenInfo> {
+    let guard = state.frozen.lock().unwrap();
+    guard.as_ref().map(|f| FrozenInfo {
+        url: format!("http://frozen.localhost/{}.png", f.nonce),
+        width: f.width,
+        height: f.height,
+    })
 }
 
 #[tauri::command]
@@ -485,6 +524,23 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 fn run() {
     log("=== lightshot-we-deserve launching ===");
     tauri::Builder::default()
+        .register_uri_scheme_protocol("frozen", |ctx, _req| {
+            let app = ctx.app_handle();
+            let guard = app.state::<AppState>();
+            let frozen = guard.frozen.lock().unwrap();
+            match frozen.as_ref() {
+                Some(f) => tauri::http::Response::builder()
+                    .header("Content-Type", "image/png")
+                    .header("Cache-Control", "no-store")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(f.png.clone())
+                    .unwrap(),
+                None => tauri::http::Response::builder()
+                    .status(404)
+                    .body(Vec::new())
+                    .unwrap(),
+            }
+        })
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
