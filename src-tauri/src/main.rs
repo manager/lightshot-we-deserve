@@ -180,11 +180,21 @@ fn grab_frozen() -> Result<FrozenShot, String> {
         }
     }
     log(&format!("frozen virtual desktop {vw}x{vh} at ({min_x},{min_y})"));
-    let dynimg = image::DynamicImage::ImageRgba8(canvas);
+    // Fast PNG: this image is only shown in the overlay for selection, so we
+    // trade a bigger in-memory blob for a much quicker encode (default zlib
+    // compression on a multi-monitor image cost seconds).
     let mut buf = std::io::Cursor::new(Vec::new());
-    dynimg
-        .write_to(&mut buf, image::ImageFormat::Png)
-        .map_err(|e| format!("png encode failed: {e}"))?;
+    let encoder = image::codecs::png::PngEncoder::new_with_quality(
+        &mut buf,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::NoFilter,
+    );
+    {
+        use image::ImageEncoder;
+        encoder
+            .write_image(canvas.as_raw(), vw, vh, image::ExtendedColorType::Rgba8)
+            .map_err(|e| format!("png encode failed: {e}"))?;
+    }
     let b64 = STANDARD.encode(buf.into_inner());
     Ok(FrozenShot {
         data_url: format!("data:image/png;base64,{b64}"),
