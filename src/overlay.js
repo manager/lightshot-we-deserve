@@ -25,6 +25,7 @@ let undoable = [];         // up to 5 undoable actions
 let current = null;        // in-progress annotation
 
 let selecting = false, drawing = false, selStart = null;
+let lastMouse = { x: 0, y: 0 };  // for placing the size badge on keyboard resize
 let textInput = null, textPos = null;
 let badgeTimer = null;
 let ready = false;
@@ -279,14 +280,28 @@ function positionUI() {
   actionbar.style.top = ay + "px";
 }
 
-function showBadge(e) {
+function showBadge(x, y) {
   if (!tool) return;
   sizeBadge.textContent = `${tool}: ${sizes[tool]}`;
-  sizeBadge.style.left = (e.clientX + 14) + "px";
-  sizeBadge.style.top = (e.clientY + 14) + "px";
+  sizeBadge.style.left = (x + 14) + "px";
+  sizeBadge.style.top = (y + 14) + "px";
   sizeBadge.style.display = "block";
   if (badgeTimer) clearTimeout(badgeTimer);
   badgeTimer = setTimeout(hideBadge, 900);
+}
+
+// Resize the active tool by `dir` steps (+1 bigger, -1 smaller). Shared by the
+// scroll wheel and the +/- and [ ] keyboard shortcuts (touchpad-friendly).
+function resizeTool(dir) {
+  if (!tool) return;
+  const step = tool === "text" ? 2 : tool === "marker" || tool === "blur" ? 2 : 1;
+  const min = tool === "text" ? 8 : 1;
+  const max = tool === "text" ? 120 : tool === "marker" ? 80 : 60;
+  sizes[tool] = Math.max(min, Math.min(max, sizes[tool] + dir * step));
+  if (textInput && tool === "text") {
+    textInput.style.fontSize = sizes.text + "px";
+    autosize(textInput);
+  }
 }
 function hideBadge() {
   sizeBadge.style.display = "none";
@@ -375,6 +390,7 @@ canvas.addEventListener("mousedown", (e) => {
 
 window.addEventListener("mousemove", (e) => {
   const pt = { x: e.clientX, y: e.clientY };
+  lastMouse = pt;
   if (selecting) {
     sel = normRect(selStart.x, selStart.y, pt.x, pt.y);
     render();
@@ -429,18 +445,10 @@ window.addEventListener("mouseup", () => {
 window.addEventListener("wheel", (e) => {
   // Plain scroll resizes the active tool — the overlay has nothing else to
   // scroll, and this makes laptop two-finger touchpad scrolling work (no Ctrl).
-  if (!tool) return;
+  if (!tool || e.deltaY === 0) return;
   e.preventDefault();
-  const step = tool === "text" ? 2 : tool === "marker" || tool === "blur" ? 2 : 1;
-  const min = tool === "text" ? 8 : 1;
-  const max = tool === "text" ? 120 : tool === "marker" ? 80 : 60;
-  let v = sizes[tool] + (e.deltaY < 0 ? step : -step);
-  sizes[tool] = Math.max(min, Math.min(max, v));
-  if (textInput && tool === "text") {
-    textInput.style.fontSize = sizes.text + "px";
-    autosize(textInput);
-  }
-  showBadge(e);
+  resizeTool(e.deltaY < 0 ? 1 : -1);
+  showBadge(e.clientX, e.clientY);
 }, { passive: false });
 
 // ---------- toolbar / actions ----------
@@ -559,6 +567,16 @@ function cancel() {
 window.addEventListener("keydown", (e) => {
   if (textInput) return; // textarea handles its own keys
   if (e.key === "Escape" || e.code === "Escape") { e.preventDefault(); cancel(); return; }
+  // Resize the active tool from the keyboard (works on any laptop, no scroll
+  // needed): +/= grows, -/_ shrinks, and [ ] do the same.
+  if (tool && !e.ctrlKey && !e.metaKey) {
+    if (e.key === "+" || e.key === "=" || e.code === "BracketRight") {
+      e.preventDefault(); resizeTool(1); showBadge(lastMouse.x, lastMouse.y); return;
+    }
+    if (e.key === "-" || e.key === "_" || e.code === "BracketLeft") {
+      e.preventDefault(); resizeTool(-1); showBadge(lastMouse.x, lastMouse.y); return;
+    }
+  }
   if (e.ctrlKey || e.metaKey) {
     // Use physical key codes so shortcuts work regardless of layout (e.g. RU).
     if (e.code === "KeyZ") { e.preventDefault(); undo(); }
