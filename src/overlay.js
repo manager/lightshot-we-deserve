@@ -8,6 +8,7 @@ const sizeBadge = document.getElementById("sizebadge");
 const toolbar = document.getElementById("toolbar");
 const actionbar = document.getElementById("actionbar");
 const swatchesEl = document.getElementById("swatches");
+const sizeVal = document.getElementById("sizeVal");
 
 const COLORS = ["#e7402e", "#e67e22", "#f1c40f", "#2ecc71", "#3498db", "#9b59b6", "#000000", "#ffffff"];
 
@@ -183,30 +184,26 @@ function drawArrow(g, a) {
   const dx = a.x2 - a.x1, dy = a.y2 - a.y1;
   const len = Math.hypot(dx, dy);
   if (len < 0.5) return;
-  const ang = Math.atan2(dy, dx);
-  // Head scales with line width but is capped to the arrow length so big
-  // arrows stay proportional instead of turning into a giant blob.
-  const headLen = Math.min(len * 0.6, Math.max(10, a.size * 4));
-  const headW = headLen * 0.62;
-  const bx = a.x2 - headLen * Math.cos(ang);  // shaft stops where head starts
-  const by = a.y2 - headLen * Math.sin(ang);
-  const px = -Math.sin(ang), py = Math.cos(ang); // unit perpendicular
+  const ux = dx / len, uy = dy / len;            // unit along the arrow
+  const px = -uy, py = ux;                        // unit perpendicular
+  // One filled outline: a shaft that widens into a proper arrowhead. Every
+  // part scales from the line width, so it stays a clean arrow at any size
+  // instead of a blob + detached triangle.
+  const shaft = a.size / 2;                        // shaft half-thickness
+  const headLen = Math.min(len, Math.max(14, a.size * 3.2));
+  const headW = Math.max(a.size * 1.9, headLen * 0.6); // barb half-width
+  const bx = a.x2 - ux * headLen, by = a.y2 - uy * headLen; // head base center
 
-  g.strokeStyle = a.color;
   g.fillStyle = a.color;
-  g.lineWidth = a.size;
-  g.lineCap = "round";
   g.lineJoin = "round";
-
   g.beginPath();
-  g.moveTo(a.x1, a.y1);
-  g.lineTo(bx, by);
-  g.stroke();
-
-  g.beginPath();
-  g.moveTo(a.x2, a.y2);
-  g.lineTo(bx + px * headW / 2, by + py * headW / 2);
-  g.lineTo(bx - px * headW / 2, by - py * headW / 2);
+  g.moveTo(a.x1 + px * shaft, a.y1 + py * shaft);
+  g.lineTo(bx + px * shaft, by + py * shaft);
+  g.lineTo(bx + px * headW, by + py * headW);
+  g.lineTo(a.x2, a.y2);
+  g.lineTo(bx - px * headW, by - py * headW);
+  g.lineTo(bx - px * shaft, by - py * shaft);
+  g.lineTo(a.x1 - px * shaft, a.y1 - py * shaft);
   g.closePath();
   g.fill();
 }
@@ -249,6 +246,11 @@ function setTool(t) {
   [...toolbar.querySelectorAll(".tool")].forEach((b) =>
     b.classList.toggle("active", b.dataset.tool === t)
   );
+  updateSizeVal();
+}
+
+function updateSizeVal() {
+  sizeVal.textContent = tool ? sizes[tool] : "–";
 }
 
 function positionUI() {
@@ -302,6 +304,7 @@ function resizeTool(dir) {
     textInput.style.fontSize = sizes.text + "px";
     autosize(textInput);
   }
+  updateSizeVal();
 }
 function hideBadge() {
   sizeBadge.style.display = "none";
@@ -458,6 +461,7 @@ toolbar.querySelectorAll(".tool").forEach((b) => {
     b.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); undo(); });
     return;
   }
+  if (b.id === "sizeDown" || b.id === "sizeUp") return; // bound below
   b.addEventListener("mousedown", (e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -465,7 +469,24 @@ toolbar.querySelectorAll(".tool").forEach((b) => {
   });
 });
 
-document.getElementById("undoBtn"); // ensured above
+// Size +/- buttons: click changes one step; press-and-hold auto-repeats.
+// Clickable controls are the bulletproof path when touchpad scroll fails.
+function bindSizeButton(id, dir) {
+  const btn = document.getElementById(id);
+  let hold, repeat;
+  const bump = () => { resizeTool(dir); showBadge(lastMouse.x, lastMouse.y); };
+  const stop = () => { clearTimeout(hold); clearInterval(repeat); };
+  btn.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    bump();
+    hold = setTimeout(() => { repeat = setInterval(bump, 70); }, 350);
+  });
+  btn.addEventListener("mouseup", stop);
+  btn.addEventListener("mouseleave", stop);
+}
+bindSizeButton("sizeDown", -1);
+bindSizeButton("sizeUp", 1);
 
 document.getElementById("saveBtn").addEventListener("click", doSave);
 document.getElementById("copyBtn").addEventListener("click", doCopy);
