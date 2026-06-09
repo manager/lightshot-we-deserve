@@ -18,6 +18,11 @@
   <label>Save folder <span class="muted">(empty = Desktop)</span></label>
   <input id="save-dir" type="text" placeholder="C:\Users\you\Pictures" />
 
+  <label class="check">
+    <input id="autostart" type="checkbox" />
+    <span>Start automatically when Windows starts</span>
+  </label>
+
   <div class="row">
     <button id="save" class="primary">Save</button>
     <button id="test">Capture full screen now</button>
@@ -25,6 +30,8 @@
   </div>
 
   <div id="status"></div>
+
+  <footer>Built by <a href="https://keepsimple.io" target="_blank" rel="noreferrer">keepsimple.io</a> team</footer>
 
   <script src="settings.js"></script>
 </body>

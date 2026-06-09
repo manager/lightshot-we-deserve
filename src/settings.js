@@ -3,6 +3,7 @@ const { invoke } = window.__TAURI__.core;
 const areaEl = document.getElementById("hk-area");
 const fullEl = document.getElementById("hk-full");
 const dirEl = document.getElementById("save-dir");
+const autostartEl = document.getElementById("autostart");
 const statusEl = document.getElementById("status");
 
 function setStatus(msg, isError) {
@@ -53,6 +54,7 @@ document.getElementById("save").addEventListener("click", async () => {
         hotkey_area: areaEl.value,
         hotkey_full: fullEl.value,
         save_dir: dirEl.value.trim(),
+        autostart: autostartEl.checked,
       },
     });
     setStatus("Saved ✓", false);
@@ -80,6 +82,7 @@ document.getElementById("close").addEventListener("click", () => {
     areaEl.value = s.hotkey_area || "";
     fullEl.value = s.hotkey_full || "";
     dirEl.value = s.save_dir || "";
+    autostartEl.checked = s.autostart !== false;
   } catch (err) {
     setStatus("Could not load settings: " + err, true);
   }

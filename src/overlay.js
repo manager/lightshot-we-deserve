@@ -54,6 +54,8 @@ async function loadFrozen() {
   resetState();
   ready = true;
   resize();
+  // Frame is painted — now reveal the window so dim + crosshair show together.
+  invoke("overlay_ready").catch(() => {});
 }
 
 function resetState() {

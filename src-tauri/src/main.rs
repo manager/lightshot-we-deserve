@@ -47,11 +47,17 @@ fn log(msg: &str) {
 
 // ---------- settings ----------
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Settings {
     hotkey_area: String,
     hotkey_full: String,
     save_dir: String,
+    #[serde(default = "default_true")]
+    autostart: bool,
 }
 
 impl Default for Settings {
@@ -60,6 +66,7 @@ impl Default for Settings {
             hotkey_area: "CmdOrCtrl+Shift+4".into(),
             hotkey_full: "CmdOrCtrl+Shift+3".into(),
             save_dir: String::new(),
+            autostart: true,
         }
     }
 }
@@ -233,8 +240,8 @@ fn show_overlay(app: &AppHandle) {
             let _ = w.set_position(PhysicalPosition::new(x, y));
             let _ = w.set_size(PhysicalSize::new(vw, vh));
         }
-        let _ = w.show();
-        let _ = w.set_focus();
+        // Stay hidden until JS has rendered the frozen frame, then it calls
+        // `overlay_ready` to reveal — avoids the dim appearing a beat late.
         let _ = w.emit("frozen-ready", ());
         return;
     }
@@ -260,10 +267,10 @@ fn show_overlay(app: &AppHandle) {
                     }
                     Err(e) => log(&format!("virtual_bounds failed: {e}")),
                 }
-                let _ = win.show();
-                let _ = win.set_focus();
+                // Built hidden; JS reveals it via `overlay_ready` once the
+                // frozen frame is painted, so dim + crosshair appear together.
                 let _ = win.emit("frozen-ready", ());
-                log("overlay opened");
+                log("overlay prepared");
             }
             Err(e) => log(&format!("overlay build failed: {e}")),
         }
@@ -335,6 +342,16 @@ fn apply_shortcuts(app: &AppHandle) {
     }
 }
 
+fn apply_autostart(app: &AppHandle, enabled: bool) {
+    use tauri_plugin_autostart::ManagerExt;
+    let mgr = app.autolaunch();
+    let res = if enabled { mgr.enable() } else { mgr.disable() };
+    match res {
+        Ok(_) => log(&format!("autostart set to {enabled}")),
+        Err(e) => log(&format!("autostart set to {enabled} failed: {e}")),
+    }
+}
+
 fn do_full_capture(app: &AppHandle) {
     let state = app.state::<AppState>();
     let dir = resolve_save_dir(&state);
@@ -354,8 +371,10 @@ fn get_settings(state: State<AppState>) -> Settings {
 #[tauri::command]
 fn save_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> Result<(), String> {
     store_settings(&settings)?;
+    let autostart = settings.autostart;
     *state.settings.lock().unwrap() = settings;
     apply_shortcuts(&app);
+    apply_autostart(&app, autostart);
     log("settings saved");
     Ok(())
 }
@@ -395,6 +414,14 @@ fn copy_capture(app: AppHandle, png_data_url: String) -> Result<(), String> {
     log("copied area screenshot to clipboard");
     hide_overlay(&app);
     Ok(())
+}
+
+#[tauri::command]
+fn overlay_ready(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("overlay") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
 }
 
 #[tauri::command]
@@ -499,6 +526,7 @@ fn run() {
             get_frozen,
             save_capture,
             copy_capture,
+            overlay_ready,
             cancel_area,
             capture_full_now,
             close_settings
@@ -515,11 +543,8 @@ fn run() {
             if let Err(e) = build_tray(&handle) {
                 log(&format!("build_tray failed: {e}"));
             }
-            use tauri_plugin_autostart::ManagerExt;
-            match handle.autolaunch().enable() {
-                Ok(_) => log("autostart enabled"),
-                Err(e) => log(&format!("autostart enable failed: {e}")),
-            }
+            let want_autostart = handle.state::<AppState>().settings.lock().unwrap().autostart;
+            apply_autostart(&handle, want_autostart);
             log("setup complete");
             Ok(())
         })
