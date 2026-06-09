@@ -32,6 +32,7 @@ let undoable = [];         // up to 5 undoable actions
 let current = null;        // in-progress annotation
 
 let selecting = false, drawing = false, selStart = null;
+let moving = false, moveStart = null;  // drag the finished selection frame
 let lastMouse = { x: 0, y: 0 };  // for placing the size badge on keyboard resize
 let textInput = null, textPos = null;
 let badgeTimer = null;
@@ -120,6 +121,12 @@ function buildBackground() {
 
 function normRect(ax, ay, bx, by) {
   return { x: Math.min(ax, bx), y: Math.min(ay, by), w: Math.abs(bx - ax), h: Math.abs(by - ay) };
+}
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+function insideSel(pt) {
+  return pt.x >= sel.x && pt.x <= sel.x + sel.w && pt.y >= sel.y && pt.y <= sel.y + sel.h;
 }
 
 // ---------- rendering ----------
@@ -395,6 +402,14 @@ canvas.addEventListener("mousedown", (e) => {
   if (textInput) { commitText(); return; }
   const pt = { x: e.clientX, y: e.clientY };
 
+  // No tool active + click inside the existing frame -> drag it instead of
+  // starting a new selection.
+  if (tool === null && sel && insideSel(pt)) {
+    moving = true;
+    moveStart = { x: pt.x, y: pt.y, sx: sel.x, sy: sel.y };
+    return;
+  }
+
   if (!sel || tool === null) {
     selecting = true;
     selStart = pt;
@@ -421,6 +436,17 @@ canvas.addEventListener("mousedown", (e) => {
 window.addEventListener("mousemove", (e) => {
   const pt = { x: e.clientX, y: e.clientY };
   lastMouse = pt;
+  if (moving) {
+    const nx = clamp(moveStart.sx + (pt.x - moveStart.x), 0, cssW - sel.w);
+    const ny = clamp(moveStart.sy + (pt.y - moveStart.y), 0, cssH - sel.h);
+    sel.x = nx; sel.y = ny;
+    positionUI();
+    render();
+    return;
+  }
+  if (!selecting && !drawing) {
+    canvas.style.cursor = (tool === null && sel && insideSel(pt)) ? "move" : "crosshair";
+  }
   if (selecting) {
     sel = normRect(selStart.x, selStart.y, pt.x, pt.y);
     render();
@@ -450,6 +476,7 @@ window.addEventListener("mousemove", (e) => {
 });
 
 window.addEventListener("mouseup", () => {
+  if (moving) { moving = false; return; }
   if (selecting) {
     selecting = false;
     if (sel.w < 4 || sel.h < 4) {
