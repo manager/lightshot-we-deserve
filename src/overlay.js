@@ -292,19 +292,25 @@ function showBadge(x, y) {
   badgeTimer = setTimeout(hideBadge, 900);
 }
 
-// Resize the active tool by `dir` steps (+1 bigger, -1 smaller). Shared by the
-// scroll wheel and the +/- and [ ] keyboard shortcuts (touchpad-friendly).
-function resizeTool(dir) {
+// Add `delta` px to the active tool size, clamped to its range.
+function nudgeSize(delta) {
   if (!tool) return;
-  const step = tool === "text" ? 2 : tool === "marker" || tool === "blur" ? 2 : 1;
   const min = tool === "text" ? 8 : 1;
   const max = tool === "text" ? 120 : tool === "marker" ? 80 : 60;
-  sizes[tool] = Math.max(min, Math.min(max, sizes[tool] + dir * step));
+  sizes[tool] = Math.max(min, Math.min(max, sizes[tool] + delta));
   if (textInput && tool === "text") {
     textInput.style.fontSize = sizes.text + "px";
     autosize(textInput);
   }
   updateSizeVal();
+}
+
+// Resize by one natural step in `dir` (+1 bigger, -1 smaller) — used by the
+// scroll wheel and the −/+ toolbar buttons.
+function resizeTool(dir) {
+  if (!tool) return;
+  const step = tool === "text" ? 2 : tool === "marker" || tool === "blur" ? 2 : 1;
+  nudgeSize(dir * step);
 }
 function hideBadge() {
   sizeBadge.style.display = "none";
@@ -610,6 +616,14 @@ window.addEventListener("keydown", (e) => {
   }
   if (e.ctrlKey || e.metaKey) {
     // Use physical key codes so shortcuts work regardless of layout (e.g. RU).
+    // Ctrl+= / Ctrl+- resize the active tool by ±3; holding the key auto-repeats
+    // (the browser fires repeated keydowns), so the size changes smoothly.
+    if (tool && (e.code === "Equal" || e.code === "NumpadAdd")) {
+      e.preventDefault(); nudgeSize(3); showBadge(lastMouse.x, lastMouse.y); return;
+    }
+    if (tool && (e.code === "Minus" || e.code === "NumpadSubtract")) {
+      e.preventDefault(); nudgeSize(-3); showBadge(lastMouse.x, lastMouse.y); return;
+    }
     if (e.code === "KeyZ") { e.preventDefault(); undo(); }
     else if (e.code === "KeyS") { e.preventDefault(); doSave(); }
     else if (e.code === "KeyC") { e.preventDefault(); doCopy(); }
