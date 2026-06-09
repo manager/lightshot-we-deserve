@@ -57,6 +57,8 @@ async function loadFrozen() {
 }
 
 function resetState() {
+  ready = false;
+  clearCanvasHard();
   sel = null;
   tool = null;
   committed = [];
@@ -103,13 +105,10 @@ function render() {
 
   if (sel) {
     ctx.drawImage(frozenImg, sel.x * sx, sel.y * sy, sel.w * sx, sel.h * sy, sel.x, sel.y, sel.w, sel.h);
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(sel.x, sel.y, sel.w, sel.h);
-    ctx.clip();
+    // Annotations are NOT clipped to the selection — the user can draw outside
+    // it (those strokes just won't end up in the cropped screenshot).
     drawAnnotations(ctx, committed.concat(undoable));
     if (current) drawOne(ctx, current);
-    ctx.restore();
 
     ctx.strokeStyle = "#2ec8c8";
     ctx.lineWidth = 1;
@@ -384,7 +383,17 @@ window.addEventListener("mousemove", (e) => {
     if (current.type === "pen" || current.type === "marker" || current.type === "blur") {
       current.points.push(pt);
     } else if (current.type === "line" || current.type === "arrow") {
-      current.x2 = pt.x; current.y2 = pt.y;
+      let nx = pt.x, ny = pt.y;
+      if (e.shiftKey) {
+        // Snap to 45° increments — gives clean horizontal / vertical lines.
+        const dx = nx - current.x1, dy = ny - current.y1;
+        const len = Math.hypot(dx, dy);
+        const step = Math.PI / 4;
+        const ang = Math.round(Math.atan2(dy, dx) / step) * step;
+        nx = current.x1 + len * Math.cos(ang);
+        ny = current.y1 + len * Math.sin(ang);
+      }
+      current.x2 = nx; current.y2 = ny;
     } else if (current.type === "rect") {
       const r = normRect(current.ox, current.oy, pt.x, pt.y);
       current.x = r.x; current.y = r.y; current.w = r.w; current.h = r.h;
@@ -501,6 +510,7 @@ async function doCopy() {
 
 function cancel() {
   cancelText();
+  resetState();
   invoke("cancel_area").catch(() => {});
 }
 

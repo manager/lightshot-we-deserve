@@ -130,6 +130,28 @@ fn primary_monitor() -> Result<xcap::Monitor, String> {
         .ok_or_else(|| "no primary monitor found".to_string())
 }
 
+// Bounding box of the whole virtual desktop (all monitors) in physical px:
+// (origin_x, origin_y, width, height).
+fn virtual_bounds() -> Result<(i32, i32, u32, u32), String> {
+    let monitors = xcap::Monitor::all().map_err(|e| format!("Monitor::all failed: {e}"))?;
+    if monitors.is_empty() {
+        return Err("no monitors found".to_string());
+    }
+    let (mut min_x, mut min_y) = (i32::MAX, i32::MAX);
+    let (mut max_x, mut max_y) = (i32::MIN, i32::MIN);
+    for m in &monitors {
+        let x = m.x().map_err(|e| e.to_string())?;
+        let y = m.y().map_err(|e| e.to_string())?;
+        let w = m.width().map_err(|e| e.to_string())? as i32;
+        let h = m.height().map_err(|e| e.to_string())? as i32;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x + w);
+        max_y = max_y.max(y + h);
+    }
+    Ok((min_x, min_y, (max_x - min_x) as u32, (max_y - min_y) as u32))
+}
+
 fn capture_full(dir: &PathBuf) -> Result<String, String> {
     let monitor = primary_monitor()?;
     let image = monitor
@@ -144,12 +166,21 @@ fn capture_full(dir: &PathBuf) -> Result<String, String> {
 }
 
 fn grab_frozen() -> Result<FrozenShot, String> {
-    let monitor = primary_monitor()?;
-    let image = monitor
-        .capture_image()
-        .map_err(|e| format!("capture_image failed: {e}"))?;
-    let (width, height) = (image.width(), image.height());
-    let dynimg = image::DynamicImage::ImageRgba8(image);
+    let (min_x, min_y, vw, vh) = virtual_bounds()?;
+    let monitors = xcap::Monitor::all().map_err(|e| format!("Monitor::all failed: {e}"))?;
+    let mut canvas = image::RgbaImage::new(vw, vh);
+    for m in &monitors {
+        let x = m.x().map_err(|e| e.to_string())?;
+        let y = m.y().map_err(|e| e.to_string())?;
+        match m.capture_image() {
+            Ok(img) => {
+                image::imageops::replace(&mut canvas, &img, (x - min_x) as i64, (y - min_y) as i64);
+            }
+            Err(e) => log(&format!("monitor capture failed at ({x},{y}): {e}")),
+        }
+    }
+    log(&format!("frozen virtual desktop {vw}x{vh} at ({min_x},{min_y})"));
+    let dynimg = image::DynamicImage::ImageRgba8(canvas);
     let mut buf = std::io::Cursor::new(Vec::new());
     dynimg
         .write_to(&mut buf, image::ImageFormat::Png)
@@ -157,8 +188,8 @@ fn grab_frozen() -> Result<FrozenShot, String> {
     let b64 = STANDARD.encode(buf.into_inner());
     Ok(FrozenShot {
         data_url: format!("data:image/png;base64,{b64}"),
-        width,
-        height,
+        width: vw,
+        height: vh,
     })
 }
 
@@ -188,6 +219,10 @@ fn begin_area_capture(app: &AppHandle) {
 
 fn show_overlay(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("overlay") {
+        if let Ok((x, y, vw, vh)) = virtual_bounds() {
+            let _ = w.set_position(PhysicalPosition::new(x, y));
+            let _ = w.set_size(PhysicalSize::new(vw, vh));
+        }
         let _ = w.show();
         let _ = w.set_focus();
         let _ = w.emit("frozen-ready", ());
@@ -208,11 +243,12 @@ fn show_overlay(app: &AppHandle) {
             .build()
         {
             Ok(win) => {
-                if let Ok(Some(monitor)) = win.current_monitor() {
-                    let pos = monitor.position();
-                    let size = monitor.size();
-                    let _ = win.set_position(PhysicalPosition::new(pos.x, pos.y));
-                    let _ = win.set_size(PhysicalSize::new(size.width, size.height));
+                match virtual_bounds() {
+                    Ok((x, y, w, h)) => {
+                        let _ = win.set_position(PhysicalPosition::new(x, y));
+                        let _ = win.set_size(PhysicalSize::new(w, h));
+                    }
+                    Err(e) => log(&format!("virtual_bounds failed: {e}")),
                 }
                 let _ = win.show();
                 let _ = win.set_focus();
