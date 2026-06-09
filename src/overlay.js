@@ -16,6 +16,12 @@ const frozenImg = new Image();
 let frozenNatW = 0, frozenNatH = 0;
 let cssW = 0, cssH = 0, dpr = 1, sx = 1, sy = 1;
 
+// Pre-rendered static background (frozen image + dim). Built once per resize,
+// then blitted each frame instead of rescaling the huge full-desktop image.
+const bgCanvas = document.createElement("canvas");
+const bgCtx = bgCanvas.getContext("2d");
+let bgReady = false;
+
 let sel = null;            // {x,y,w,h} in css px
 let tool = null;           // null=select, or pen/line/arrow/rect/marker/text/blur
 let color = COLORS[0];
@@ -92,8 +98,24 @@ function resize() {
   canvas.style.width = cssW + "px";
   canvas.style.height = cssH + "px";
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  buildBackground();
   positionUI();
   render();
+}
+
+// Paint the frozen image + dim layer once into an offscreen canvas at device
+// resolution. render() then just copies this in one fast blit per frame.
+function buildBackground() {
+  bgReady = false;
+  if (!ready || !frozenImg.complete || !frozenNatW) return;
+  bgCanvas.width = Math.round(cssW * dpr);
+  bgCanvas.height = Math.round(cssH * dpr);
+  bgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  bgCtx.clearRect(0, 0, cssW, cssH);
+  bgCtx.drawImage(frozenImg, 0, 0, cssW, cssH);
+  bgCtx.fillStyle = "rgba(0,0,0,0.45)";
+  bgCtx.fillRect(0, 0, cssW, cssH);
+  bgReady = true;
 }
 
 function normRect(ax, ay, bx, by) {
@@ -105,9 +127,8 @@ function normRect(ax, ay, bx, by) {
 function render() {
   ctx.clearRect(0, 0, cssW, cssH);
   if (!ready || !frozenImg.complete || !frozenNatW) return;
-  ctx.drawImage(frozenImg, 0, 0, cssW, cssH);
-  ctx.fillStyle = "rgba(0,0,0,0.45)";
-  ctx.fillRect(0, 0, cssW, cssH);
+  if (!bgReady) buildBackground();
+  ctx.drawImage(bgCanvas, 0, 0, cssW, cssH);
 
   if (sel) {
     ctx.drawImage(frozenImg, sel.x * sx, sel.y * sy, sel.w * sx, sel.h * sy, sel.x, sel.y, sel.w, sel.h);
