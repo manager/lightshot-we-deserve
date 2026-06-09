@@ -445,12 +445,22 @@ window.addEventListener("mouseup", () => {
   }
 });
 
+// Touchpads fire many tiny wheel events per swipe (and mice fire a few big
+// ones), so accumulate scroll distance and emit exactly one size step per
+// fixed chunk — same predictable feel on both, no random jumps.
+let wheelAccum = 0;
+const WHEEL_STEP_PX = 100;
 window.addEventListener("wheel", (e) => {
-  // Plain scroll resizes the active tool — the overlay has nothing else to
-  // scroll, and this makes laptop two-finger touchpad scrolling work (no Ctrl).
   if (!tool || e.deltaY === 0) return;
   e.preventDefault();
-  resizeTool(e.deltaY < 0 ? 1 : -1);
+  let d = e.deltaY;
+  if (e.deltaMode === 1) d *= 16;        // lines -> ~px
+  else if (e.deltaMode === 2) d *= 100;  // pages -> ~px
+  wheelAccum += d;
+  while (Math.abs(wheelAccum) >= WHEEL_STEP_PX) {
+    resizeTool(wheelAccum < 0 ? 1 : -1);
+    wheelAccum -= Math.sign(wheelAccum) * WHEEL_STEP_PX;
+  }
   showBadge(e.clientX, e.clientY);
 }, { passive: false });
 
