@@ -140,6 +140,29 @@ fn timestamp_name() -> String {
     )
 }
 
+// Turn a user-typed name into a safe single-segment filename ending in .png.
+// Strips path separators and characters Windows rejects; empty -> timestamp.
+fn custom_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(['.', ' ']).to_string();
+    if cleaned.is_empty() {
+        return timestamp_name();
+    }
+    if cleaned.to_lowercase().ends_with(".png") {
+        cleaned
+    } else {
+        format!("{cleaned}.png")
+    }
+}
+
 fn primary_monitor() -> Result<xcap::Monitor, String> {
     let monitors = xcap::Monitor::all().map_err(|e| format!("Monitor::all failed: {e}"))?;
     monitors
@@ -405,11 +428,15 @@ fn get_frozen(state: State<AppState>) -> Option<FrozenInfo> {
 }
 
 #[tauri::command]
-fn save_capture(app: AppHandle, png_data_url: String) -> Result<String, String> {
+fn save_capture(app: AppHandle, png_data_url: String, name: Option<String>) -> Result<String, String> {
     let bytes = decode_png_data_url(&png_data_url)?;
     let dir = resolve_save_dir(&app.state::<AppState>());
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(timestamp_name());
+    let file_name = match name {
+        Some(n) if !n.trim().is_empty() => custom_name(&n),
+        _ => timestamp_name(),
+    };
+    let path = dir.join(file_name);
     fs::write(&path, &bytes).map_err(|e| format!("save failed: {e}"))?;
     let p = path.to_string_lossy().to_string();
     log(&format!("saved area screenshot: {p}"));

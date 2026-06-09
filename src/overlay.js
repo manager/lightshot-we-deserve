@@ -73,6 +73,7 @@ function resetState() {
   setTool(null);
   hint.style.display = "";
   hideBadge();
+  if (nameModal) nameModal.classList.add("hidden");
   positionUI();
 }
 
@@ -458,7 +459,22 @@ document.getElementById("undoBtn"); // ensured above
 
 document.getElementById("saveBtn").addEventListener("click", doSave);
 document.getElementById("copyBtn").addEventListener("click", doCopy);
+document.getElementById("saveAsBtn").addEventListener("click", openNameModal);
 document.getElementById("closeBtn").addEventListener("click", cancel);
+
+const nameModal = document.getElementById("nameModal");
+const nameInput = document.getElementById("nameInput");
+document.getElementById("nameOk").addEventListener("click", confirmNameSave);
+document.getElementById("nameCancel").addEventListener("click", closeNameModal);
+nameModal.addEventListener("mousedown", (e) => {
+  e.stopPropagation();
+  if (e.target === nameModal) closeNameModal();
+});
+nameInput.addEventListener("keydown", (e) => {
+  e.stopPropagation();
+  if (e.key === "Enter") { e.preventDefault(); confirmNameSave(); }
+  else if (e.key === "Escape") { e.preventDefault(); closeNameModal(); }
+});
 [toolbar, actionbar].forEach((p) =>
   p.addEventListener("mousedown", (e) => e.stopPropagation())
 );
@@ -494,6 +510,28 @@ async function doSave() {
   try {
     const url = exportPNG();
     await invoke("save_capture", { pngDataUrl: url });
+    resetState();
+  } catch (_) { /* keep editor open on failure */ }
+}
+
+function openNameModal() {
+  if (!sel) return;
+  if (textInput) commitText();
+  nameInput.value = "";
+  nameModal.classList.remove("hidden");
+  nameInput.focus();
+}
+
+function closeNameModal() {
+  nameModal.classList.add("hidden");
+}
+
+async function confirmNameSave() {
+  const name = nameInput.value;
+  closeNameModal();
+  try {
+    const url = exportPNG();
+    await invoke("save_capture", { pngDataUrl: url, name });
     resetState();
   } catch (_) { /* keep editor open on failure */ }
 }

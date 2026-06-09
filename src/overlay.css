@@ -117,6 +117,57 @@ html, body {
 #actionbar #closeBtn { background: #5a2b2b; }
 #actionbar #closeBtn:hover { background: #7a3636; }
 
+#nameModal {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 40;
+  cursor: default;
+}
+#nameModal.hidden { display: none; }
+#nameBox {
+  position: static;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  min-width: 280px;
+}
+#nameBox label {
+  color: #ddd;
+  font-size: 13px;
+}
+#nameInput {
+  border: 1px solid #555;
+  border-radius: 5px;
+  background: #1f1f1f;
+  color: #fff;
+  font-size: 14px;
+  padding: 8px 10px;
+  outline: none;
+}
+#nameInput:focus { border-color: #2ec8c8; }
+#nameBtns {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+#nameBtns button {
+  border: none;
+  border-radius: 5px;
+  background: #3d3d3d;
+  color: #fff;
+  font-size: 13px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+#nameBtns button:hover { background: #4a4a4a; }
+#nameBtns #nameOk { background: #2ec8c8; color: #06302f; font-weight: 600; }
+#nameBtns #nameOk:hover { background: #45d6d6; }
+
 #textinput {
   position: fixed;
   margin: 0;

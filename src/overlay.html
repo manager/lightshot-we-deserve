@@ -27,7 +27,19 @@
   <div id="actionbar" class="panel">
     <button id="copyBtn" title="Copy (Ctrl+C)">Copy</button>
     <button id="saveBtn" title="Save (Ctrl+S)">Save</button>
+    <button id="saveAsBtn" title="Save with a name">Save as&hellip;</button>
     <button id="closeBtn" title="Close (Esc)">&#10005;</button>
+  </div>
+
+  <div id="nameModal" class="hidden">
+    <div id="nameBox" class="panel">
+      <label for="nameInput">File name</label>
+      <input id="nameInput" type="text" placeholder="My screenshot" autocomplete="off" />
+      <div id="nameBtns">
+        <button id="nameCancel">Cancel</button>
+        <button id="nameOk">Save</button>
+      </div>
+    </div>
   </div>
 
   <script src="overlay.js"></script>
