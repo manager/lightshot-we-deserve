@@ -427,7 +427,9 @@ window.addEventListener("mouseup", () => {
 });
 
 window.addEventListener("wheel", (e) => {
-  if (!e.ctrlKey || !tool) return;
+  // Plain scroll resizes the active tool — the overlay has nothing else to
+  // scroll, and this makes laptop two-finger touchpad scrolling work (no Ctrl).
+  if (!tool) return;
   e.preventDefault();
   const step = tool === "text" ? 2 : tool === "marker" || tool === "blur" ? 2 : 1;
   const min = tool === "text" ? 8 : 1;
