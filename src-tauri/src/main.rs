@@ -194,31 +194,16 @@ fn grab_frozen() -> Result<Frozen, String> {
     let (min_x, min_y, vw, vh) = virtual_bounds()?;
     let monitors = xcap::Monitor::all().map_err(|e| format!("Monitor::all failed: {e}"))?;
 
-    // Capture every monitor in parallel — on multi-monitor setups the per-screen
-    // grabs dominate latency, so we don't want them serialized.
-    let shots: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = monitors
-            .iter()
-            .map(|m| {
-                s.spawn(move || {
-                    let x = m.x().unwrap_or(0);
-                    let y = m.y().unwrap_or(0);
-                    match m.capture_image() {
-                        Ok(img) => Some((x, y, img)),
-                        Err(e) => {
-                            log(&format!("monitor capture failed at ({x},{y}): {e}"));
-                            None
-                        }
-                    }
-                })
-            })
-            .collect();
-        handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
-    });
-
+    // xcap's Monitor wraps a raw OS handle that is neither Send nor Sync, so the
+    // grabs can't be parallelized across threads — capture each screen in turn.
     let mut canvas = image::RgbaImage::new(vw, vh);
-    for (x, y, img) in shots {
-        image::imageops::replace(&mut canvas, &img, (x - min_x) as i64, (y - min_y) as i64);
+    for m in &monitors {
+        let x = m.x().unwrap_or(0);
+        let y = m.y().unwrap_or(0);
+        match m.capture_image() {
+            Ok(img) => image::imageops::replace(&mut canvas, &img, (x - min_x) as i64, (y - min_y) as i64),
+            Err(e) => log(&format!("monitor capture failed at ({x},{y}): {e}")),
+        }
     }
 
     // Fast PNG (low compression, no filter): the blob is only displayed in the
