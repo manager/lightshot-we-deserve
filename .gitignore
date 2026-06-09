@@ -9,3 +9,4 @@ node_modules/
 /src-tauri/target/
 /src-tauri/gen/schemas/
 dist/
+.claude/scheduled_tasks.lock
