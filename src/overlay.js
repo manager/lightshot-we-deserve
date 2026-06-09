@@ -261,22 +261,19 @@ function positionUI() {
   const tb = toolbar.getBoundingClientRect();
   const tw = tb.width || 40, th = tb.height || 280;
   let tx = sel.x + sel.w + 8;
-  if (tx + tw > cssW) tx = sel.x - tw - 8;
-  if (tx < 4) tx = Math.max(4, Math.min(cssW - tw - 4, sel.x + sel.w + 8));
+  if (tx + tw > cssW - 4) tx = sel.x - tw - 8;
+  tx = Math.max(4, Math.min(tx, cssW - tw - 4));
   let ty = sel.y;
-  if (ty + th > cssH) ty = cssH - th - 4;
-  if (ty < 4) ty = 4;
+  ty = Math.max(4, Math.min(ty, cssH - th - 4));
   toolbar.style.left = tx + "px";
   toolbar.style.top = ty + "px";
 
   const ab = actionbar.getBoundingClientRect();
   const aw = ab.width || 180, ah = ab.height || 36;
-  let ax = sel.x + sel.w - aw;
-  if (ax < 4) ax = 4;
-  if (ax + aw > cssW) ax = cssW - aw - 4;
   let ay = sel.y + sel.h + 8;
-  if (ay + ah > cssH) ay = sel.y - ah - 8;
-  if (ay < 4) ay = 4;
+  if (ay + ah > cssH - 4) ay = sel.y - ah - 8;
+  ay = Math.max(4, Math.min(ay, cssH - ah - 4));
+  let ax = Math.max(4, Math.min(sel.x + sel.w - aw, cssW - aw - 4));
   actionbar.style.left = ax + "px";
   actionbar.style.top = ay + "px";
 }
