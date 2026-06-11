@@ -16,6 +16,7 @@ Grab the latest build from the [Releases page](https://github.com/manager/lights
 ## Features
 
 - Area and full-screen capture via global hotkeys
+- High-contrast crosshair that stays visible on light and dark backgrounds
 - Annotate: pen, line, arrow, rectangle, marker, text, and blur
 - Adjustable tool size and color
 - Copy to clipboard, save, or "Save as…" with a custom name

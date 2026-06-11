@@ -445,7 +445,8 @@ window.addEventListener("mousemove", (e) => {
     return;
   }
   if (!selecting && !drawing) {
-    canvas.style.cursor = (tool === null && sel && insideSel(pt)) ? "move" : "crosshair";
+    // "" falls back to the high-contrast crosshair defined in overlay.css.
+    canvas.style.cursor = (tool === null && sel && insideSel(pt)) ? "move" : "";
   }
   if (selecting) {
     sel = normRect(selStart.x, selStart.y, pt.x, pt.y);
