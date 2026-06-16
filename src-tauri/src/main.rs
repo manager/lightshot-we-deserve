@@ -193,6 +193,26 @@ fn virtual_bounds() -> Result<(i32, i32, u32, u32), String> {
     Ok((min_x, min_y, (max_x - min_x) as u32, (max_y - min_y) as u32))
 }
 
+// Snapshot of every monitor's (x, y, width, height), sorted so two reads taken a
+// moment apart can be compared for equality. Used to tell whether the desktop
+// geometry has stopped moving after a wake / dock event.
+fn monitor_layout() -> Result<Vec<(i32, i32, u32, u32)>, String> {
+    let monitors = xcap::Monitor::all().map_err(|e| format!("Monitor::all failed: {e}"))?;
+    let mut layout: Vec<(i32, i32, u32, u32)> = monitors
+        .iter()
+        .map(|m| {
+            (
+                m.x().unwrap_or(0),
+                m.y().unwrap_or(0),
+                m.width().unwrap_or(0),
+                m.height().unwrap_or(0),
+            )
+        })
+        .collect();
+    layout.sort_unstable();
+    Ok(layout)
+}
+
 fn capture_full(dir: &PathBuf) -> Result<String, String> {
     let monitor = primary_monitor()?;
     let image = monitor
@@ -214,20 +234,56 @@ fn next_nonce() -> u64 {
         .unwrap_or(0)
 }
 
-fn grab_frozen() -> Result<Frozen, String> {
-    let (min_x, min_y, vw, vh) = virtual_bounds()?;
+// One capture attempt. Geometry and pixels are taken from the SAME enumeration
+// pass so they can't disagree within an attempt; the layout is then re-read and,
+// unless `force` is set, the attempt is rejected (Ok(None)) if it moved while we
+// were capturing — the tell-tale of an unsettled post-wake/dock desktop.
+fn grab_frozen_once(force: bool) -> Result<Option<Frozen>, String> {
     let monitors = xcap::Monitor::all().map_err(|e| format!("Monitor::all failed: {e}"))?;
+    if monitors.is_empty() {
+        return Err("no monitors found".to_string());
+    }
 
     // xcap's Monitor wraps a raw OS handle that is neither Send nor Sync, so the
     // grabs can't be parallelized across threads — capture each screen in turn.
-    let mut canvas = image::RgbaImage::new(vw, vh);
+    let mut placed: Vec<(i32, i32, image::RgbaImage)> = Vec::new();
+    let mut layout: Vec<(i32, i32, u32, u32)> = Vec::new();
     for m in &monitors {
         let x = m.x().unwrap_or(0);
         let y = m.y().unwrap_or(0);
+        layout.push((x, y, m.width().unwrap_or(0), m.height().unwrap_or(0)));
         match m.capture_image() {
-            Ok(img) => image::imageops::replace(&mut canvas, &img, (x - min_x) as i64, (y - min_y) as i64),
+            Ok(img) => placed.push((x, y, img)),
             Err(e) => log(&format!("monitor capture failed at ({x},{y}): {e}")),
         }
+    }
+    if placed.is_empty() {
+        return Err("all monitor captures failed".to_string());
+    }
+    layout.sort_unstable();
+
+    // If the OS reports a different layout now than when we started, the desktop
+    // geometry was still shifting and the composite would be garbled — bail so
+    // the caller can retry once things settle.
+    if !force && layout != monitor_layout()? {
+        return Ok(None);
+    }
+
+    // Bounds derived from the frames we actually captured (their real pixel
+    // sizes), so a screen can never be clipped or overlapped in the stitch.
+    let (mut min_x, mut min_y) = (i32::MAX, i32::MAX);
+    let (mut max_x, mut max_y) = (i32::MIN, i32::MIN);
+    for (x, y, img) in &placed {
+        min_x = min_x.min(*x);
+        min_y = min_y.min(*y);
+        max_x = max_x.max(*x + img.width() as i32);
+        max_y = max_y.max(*y + img.height() as i32);
+    }
+    let (vw, vh) = ((max_x - min_x) as u32, (max_y - min_y) as u32);
+
+    let mut canvas = image::RgbaImage::new(vw, vh);
+    for (x, y, img) in &placed {
+        image::imageops::replace(&mut canvas, img, (*x - min_x) as i64, (*y - min_y) as i64);
     }
 
     // Uncompressed BMP: the blob is only displayed in the overlay, so we skip the
@@ -240,12 +296,37 @@ fn grab_frozen() -> Result<Frozen, String> {
             .map_err(|e| format!("bmp encode failed: {e}"))?;
     }
     log(&format!("frozen virtual desktop {vw}x{vh} at ({min_x},{min_y})"));
-    Ok(Frozen {
+    Ok(Some(Frozen {
         bytes: buf.into_inner(),
         width: vw,
         height: vh,
         nonce: next_nonce(),
-    })
+    }))
+}
+
+fn grab_frozen() -> Result<Frozen, String> {
+    // After waking from sleep or (re)attaching a dock, Windows reports a shifting
+    // monitor layout for up to ~1s; a capture taken then looks "caught mid-resize".
+    // Retry until the layout reads stable, then fall back to a forced grab so a
+    // screenshot is never blocked outright.
+    const MAX_ATTEMPTS: u32 = 10;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match grab_frozen_once(false) {
+            Ok(Some(frozen)) => {
+                if attempt > 1 {
+                    log(&format!("monitor layout settled after {attempt} attempts"));
+                }
+                return Ok(frozen);
+            }
+            Ok(None) => log(&format!(
+                "monitor layout unsettled (attempt {attempt}/{MAX_ATTEMPTS}); retrying"
+            )),
+            Err(e) => return Err(e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+    log("monitor layout never settled; taking a best-effort capture");
+    grab_frozen_once(true)?.ok_or_else(|| "forced capture produced no frame".to_string())
 }
 
 fn decode_png_data_url(s: &str) -> Result<Vec<u8>, String> {
