@@ -578,46 +578,106 @@ fn hide_overlay(app: &AppHandle) {
     *app.state::<AppState>().frozen.lock().unwrap() = None;
 }
 
-// Small always-on-top "● REC + Stop" indicator shown while recording. Parked in
-// the bottom-right of the primary monitor, out of the way of most selections.
-fn show_recorder(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("recorder") {
-        let _ = w.show();
-        let _ = w.set_focus();
-        return;
+const REC_BORDER: i32 = 3;
+
+// While recording, frame the captured region with a thin border (so the user
+// sees exactly what is being recorded) and show a small Stop/timer bar just
+// OUTSIDE the region. Capture grabs only the region rect, so neither the border
+// nor the bar ever lands in the video. (ax, ay) are physical px in the virtual-
+// desktop space, matching the overlay/window coordinate origin.
+fn show_record_ui(app: &AppHandle, ax: i32, ay: i32, w: u32, h: u32) {
+    let bx = ax - REC_BORDER;
+    let by = ay - REC_BORDER;
+    let bw = (w as i32 + REC_BORDER * 2).max(1) as u32;
+    let bh = (h as i32 + REC_BORDER * 2).max(1) as u32;
+
+    let (cw, ch) = (150i32, 40i32);
+    let (vx, vy, vw, vh) =
+        virtual_bounds().unwrap_or((bx, by, bw + 400, bh + 400));
+    let vx2 = vx + vw as i32;
+    let vy2 = vy + vh as i32;
+
+    // Prefer the bar just below the region; flip above if it would run off-screen.
+    let mut cy = ay + h as i32 + REC_BORDER + 6;
+    if cy + ch > vy2 {
+        cy = ay - REC_BORDER - 6 - ch;
     }
+    if cy < vy {
+        cy = vy;
+    }
+    let cx = ax.min(vx2 - cw).max(vx);
+
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         let app = handle;
-        match WebviewWindowBuilder::new(&app, "recorder", WebviewUrl::App("recorder.html".into()))
-            .title("Recording")
+
+        // Border frame around the region — click-through so the user can keep
+        // interacting with whatever is being recorded.
+        if let Some(win) = app.get_webview_window("recborder") {
+            let _ = win.set_position(PhysicalPosition::new(bx, by));
+            let _ = win.set_size(PhysicalSize::new(bw, bh));
+            let _ = win.show();
+        } else {
+            match WebviewWindowBuilder::new(
+                &app,
+                "recborder",
+                WebviewUrl::App("border.html".into()),
+            )
+            .title("Recording area")
             .decorations(false)
             .transparent(true)
             .always_on_top(true)
             .skip_taskbar(true)
             .resizable(false)
             .shadow(false)
-            .inner_size(196.0, 48.0)
+            .focused(false)
+            .visible(false)
             .build()
-        {
-            Ok(win) => {
-                if let Ok(m) = primary_monitor() {
-                    let mx = m.x().unwrap_or(0);
-                    let my = m.y().unwrap_or(0);
-                    let mw = m.width().unwrap_or(0) as i32;
-                    let mh = m.height().unwrap_or(0) as i32;
-                    let _ = win.set_position(PhysicalPosition::new(mx + mw - 220, my + mh - 84));
+            {
+                Ok(win) => {
+                    let _ = win.set_ignore_cursor_events(true);
+                    let _ = win.set_position(PhysicalPosition::new(bx, by));
+                    let _ = win.set_size(PhysicalSize::new(bw, bh));
+                    let _ = win.show();
+                    log("record border shown");
                 }
-                let _ = win.set_focus();
-                log("recorder indicator shown");
+                Err(e) => log(&format!("record border build failed: {e}")),
             }
-            Err(e) => log(&format!("recorder build failed: {e}")),
+        }
+
+        // Stop/timer bar just outside the region.
+        if let Some(win) = app.get_webview_window("recorder") {
+            let _ = win.set_position(PhysicalPosition::new(cx, cy));
+            let _ = win.show();
+            let _ = win.set_focus();
+        } else {
+            match WebviewWindowBuilder::new(&app, "recorder", WebviewUrl::App("recorder.html".into()))
+                .title("Recording")
+                .decorations(false)
+                .transparent(true)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                .resizable(false)
+                .shadow(false)
+                .inner_size(cw as f64, ch as f64)
+                .build()
+            {
+                Ok(win) => {
+                    let _ = win.set_position(PhysicalPosition::new(cx, cy));
+                    let _ = win.set_focus();
+                    log("recorder bar shown");
+                }
+                Err(e) => log(&format!("recorder build failed: {e}")),
+            }
         }
     });
 }
 
 fn hide_recorder(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("recorder") {
+        let _ = w.hide();
+    }
+    if let Some(w) = app.get_webview_window("recborder") {
         let _ = w.hide();
     }
 }
@@ -867,12 +927,21 @@ fn start_recording(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> Result<(),
         log(&m);
         m
     })?;
-    let mut stdin = child.stdin.take().ok_or("ffmpeg stdin unavailable")?;
+    let mut stdin = match child.stdin.take() {
+        Some(s) => s,
+        None => {
+            log("ffmpeg stdin unavailable; aborting recording");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("ffmpeg stdin unavailable".into());
+        }
+    };
+    log("ffmpeg stdin acquired");
 
-    // ffmpeg launched OK -> dismiss the overlay and show the indicator before
+    // ffmpeg launched OK -> dismiss the overlay and show the recording UI before
     // the capture thread takes its first frame.
     hide_overlay(&app);
-    show_recorder(&app);
+    show_record_ui(&app, ax, ay, w, h);
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_t = stop.clone();
