@@ -531,6 +531,30 @@ fn begin_area_capture(app: &AppHandle) {
     show_overlay(app);
 }
 
+// Build the area-selection overlay once, hidden, at startup. Creating the
+// webview the first time a hotkey fires makes the screen flash on that first
+// capture; pre-creating it means the window already exists and only needs to be
+// filled with the frozen frame and shown — seamless from the very first press.
+fn create_overlay_window(app: &AppHandle) {
+    if app.get_webview_window("overlay").is_some() {
+        return;
+    }
+    match WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("overlay.html".into()))
+        .title("Select area")
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .shadow(false)
+        .visible(false)
+        .build()
+    {
+        Ok(_) => log("overlay window pre-created"),
+        Err(e) => log(&format!("overlay pre-create failed: {e}")),
+    }
+}
+
 fn show_overlay(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("overlay") {
         if let Ok((x, y, vw, vh)) = virtual_bounds() {
@@ -1221,6 +1245,7 @@ fn run() {
             let want_autostart = handle.state::<AppState>().settings.lock().unwrap().autostart;
             apply_autostart(&handle, want_autostart);
             create_indicator_windows(&handle);
+            create_overlay_window(&handle);
             log("setup complete");
             Ok(())
         })
