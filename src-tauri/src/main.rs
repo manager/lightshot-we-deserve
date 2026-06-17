@@ -909,7 +909,24 @@ fn start_recording(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> Result<(),
             }
         }
         drop(stdin); // EOF -> ffmpeg finalizes and writes the moov atom
-        let _ = child.wait();
+        // Wait for ffmpeg to flush the moov atom, but never wait forever: if it
+        // wedges, kill it so the file is closed and nothing leaks.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if std::time::Instant::now() > deadline {
+                        log("ffmpeg did not exit in time; terminating");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
         if ffmpeg_died {
             log("recording aborted: ffmpeg exited early (see recording-ffmpeg.log)");
             // Free the slot so the user can start another recording, and tell
@@ -937,10 +954,12 @@ fn stop_recording(app: AppHandle) -> Result<(), String> {
     let rec = app.state::<AppState>().recording.lock().unwrap().take();
     if let Some(mut r) = rec {
         r.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = r.handle.take() {
-            let _ = h.join();
-        }
-        log("recording stopped");
+        // Detach the capture thread instead of joining here: this command runs on
+        // the UI thread, and ffmpeg can take a beat to finalize the file. Joining
+        // would freeze the window and global hotkeys until it returns. The thread
+        // closes ffmpeg's input and writes the file on its own.
+        drop(r.handle.take());
+        log("recording stop requested");
     }
     hide_recorder(&app);
     Ok(())
