@@ -559,6 +559,18 @@ document.getElementById("saveAsBtn").addEventListener("click", openNameModal);
 document.getElementById("recordBtn").addEventListener("click", doRecord);
 document.getElementById("closeBtn").addEventListener("click", cancel);
 
+// Per-recording video quality, chosen on the overlay before hitting Record.
+// Defaults to High; passed straight to start_recording so it overrides the
+// saved setting for this capture only.
+let recordQuality = "high";
+const qualityBtn = document.getElementById("qualityBtn");
+qualityBtn.addEventListener("mousedown", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  recordQuality = recordQuality === "high" ? "low" : "high";
+  qualityBtn.textContent = "Quality: " + (recordQuality === "high" ? "High" : "Low");
+});
+
 const nameModal = document.getElementById("nameModal");
 const nameInput = document.getElementById("nameInput");
 document.getElementById("nameOk").addEventListener("click", confirmNameSave);
@@ -655,7 +667,7 @@ async function doRecord() {
   const h = Math.round(sel.h * sy);
   if (w < 8 || h < 8) return;
   try {
-    await invoke("start_recording", { x, y, w, h });
+    await invoke("start_recording", { x, y, w, h, quality: recordQuality });
     resetState();
   } catch (_) {
     // Surface the failure (most likely the bundled video component is missing)

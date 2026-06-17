@@ -850,7 +850,14 @@ fn cancel_area(app: AppHandle) {
 // the user selected on. The overlay is dismissed before the first frame so it
 // never appears in the video.
 #[tauri::command]
-fn start_recording(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> Result<(), String> {
+fn start_recording(
+    app: AppHandle,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    quality: Option<String>,
+) -> Result<(), String> {
     log(&format!("start_recording requested: x={x} y={y} w={w} h={h}"));
     let state = app.state::<AppState>();
     if state.recording.lock().unwrap().is_some() {
@@ -866,8 +873,11 @@ fn start_recording(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> Result<(),
     let ax = vx + x;
     let ay = vy + y;
 
+    // The overlay can pick quality per-recording; fall back to the saved setting.
     let (fps, crf, scale) = {
-        let q = state.settings.lock().unwrap().video_quality.clone();
+        let q = quality
+            .filter(|q| q == "low" || q == "high")
+            .unwrap_or_else(|| state.settings.lock().unwrap().video_quality.clone());
         quality_params(&q)
     };
 
@@ -1035,6 +1045,9 @@ fn start_recording(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> Result<(),
     hide_overlay(&app);
     log("showing record ui");
     show_record_ui(&app, ax, ay, w, h);
+    // The indicator window is reused across recordings, so its timer/Stop state
+    // must be reset each time — tell it a fresh recording just began.
+    let _ = app.emit("recording-started", ());
 
     log(&format!(
         "recording started -> {} ({w}x{h} @ {fps}fps, crf {crf})",
