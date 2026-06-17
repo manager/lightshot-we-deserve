@@ -8,5 +8,7 @@ node_modules/
 # Rust / Tauri
 /src-tauri/target/
 /src-tauri/gen/schemas/
+/src-tauri/binaries/
 dist/
 .claude/scheduled_tasks.lock
+.codegraph/

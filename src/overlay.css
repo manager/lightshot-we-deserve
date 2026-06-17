@@ -136,6 +136,8 @@ html, body {
 #actionbar button:hover { background: #4a4a4a; }
 #actionbar #saveBtn { background: #2ec8c8; color: #06302f; font-weight: 600; }
 #actionbar #saveBtn:hover { background: #45d6d6; }
+#actionbar #recordBtn { background: #c0392b; font-weight: 600; }
+#actionbar #recordBtn:hover { background: #d94535; }
 #actionbar #closeBtn { background: #5a2b2b; }
 #actionbar #closeBtn:hover { background: #7a3636; }
 

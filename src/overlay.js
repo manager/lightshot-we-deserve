@@ -556,6 +556,7 @@ bindSizeButton("sizeUp", 1);
 document.getElementById("saveBtn").addEventListener("click", doSave);
 document.getElementById("copyBtn").addEventListener("click", doCopy);
 document.getElementById("saveAsBtn").addEventListener("click", openNameModal);
+document.getElementById("recordBtn").addEventListener("click", doRecord);
 document.getElementById("closeBtn").addEventListener("click", cancel);
 
 const nameModal = document.getElementById("nameModal");
@@ -640,6 +641,28 @@ async function doCopy() {
     await invoke("copy_capture", { pngDataUrl: url });
     resetState();
   } catch (_) { /* keep editor open on failure */ }
+}
+
+// Hand the selection to the recorder in physical px relative to the frozen
+// frame's origin (sx/sy map css -> native). The backend dismisses this overlay
+// before grabbing the first frame, so the dim layer never lands in the video.
+async function doRecord() {
+  if (!sel) return;
+  if (textInput) commitText();
+  const x = Math.round(sel.x * sx);
+  const y = Math.round(sel.y * sy);
+  const w = Math.round(sel.w * sx);
+  const h = Math.round(sel.h * sy);
+  if (w < 8 || h < 8) return;
+  try {
+    await invoke("start_recording", { x, y, w, h });
+    resetState();
+  } catch (_) {
+    // Surface the failure (most likely the bundled video component is missing)
+    // instead of silently doing nothing, then leave the editor open.
+    hint.textContent = "Couldn't start recording — try saving a screenshot instead.";
+    hint.style.display = "";
+  }
 }
 
 function cancel() {

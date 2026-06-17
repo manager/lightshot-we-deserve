@@ -4,6 +4,7 @@ const areaEl = document.getElementById("hk-area");
 const fullEl = document.getElementById("hk-full");
 const dirEl = document.getElementById("save-dir");
 const autostartEl = document.getElementById("autostart");
+const qualityEl = document.getElementById("video-quality");
 const statusEl = document.getElementById("status");
 
 function setStatus(msg, isError) {
@@ -55,6 +56,7 @@ document.getElementById("save").addEventListener("click", async () => {
         hotkey_full: fullEl.value,
         save_dir: dirEl.value.trim(),
         autostart: autostartEl.checked,
+        video_quality: qualityEl.value,
       },
     });
     setStatus("Saved ✓", false);
@@ -83,6 +85,7 @@ document.getElementById("close").addEventListener("click", () => {
     fullEl.value = s.hotkey_full || "";
     dirEl.value = s.save_dir || "";
     autostartEl.checked = s.autostart !== false;
+    qualityEl.value = s.video_quality === "low" ? "low" : "high";
   } catch (err) {
     setStatus("Could not load settings: " + err, true);
   }
