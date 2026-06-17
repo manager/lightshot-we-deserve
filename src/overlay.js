@@ -563,13 +563,9 @@ document.getElementById("closeBtn").addEventListener("click", cancel);
 // Defaults to High; passed straight to start_recording so it overrides the
 // saved setting for this capture only.
 let recordQuality = "high";
-const qualityBtn = document.getElementById("qualityBtn");
-qualityBtn.addEventListener("mousedown", (e) => {
-  e.preventDefault();
-  e.stopPropagation();
-  recordQuality = recordQuality === "high" ? "low" : "high";
-  qualityBtn.textContent = "Quality: " + (recordQuality === "high" ? "High" : "Low");
-});
+const qualitySel = document.getElementById("qualitySel");
+qualitySel.addEventListener("mousedown", (e) => e.stopPropagation());
+qualitySel.addEventListener("change", () => { recordQuality = qualitySel.value; });
 
 const nameModal = document.getElementById("nameModal");
 const nameInput = document.getElementById("nameInput");

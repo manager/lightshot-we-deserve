@@ -361,13 +361,16 @@ fn video_name() -> String {
     )
 }
 
-// (frames_per_second, x264 crf, optional downscale filter).
+// (frames_per_second, x264 crf, optional downscale filter). Lower crf = higher
+// quality + bigger file.
 fn quality_params(q: &str) -> (u32, u32, Option<String>) {
     match q {
         // Cap the long edge at 1280 px; never upscales (min picks the source
         // size when it's already smaller). -2 keeps aspect with an even height,
         // which yuv420p requires.
         "low" => (15, 30, Some("scale='min(1280,iw)':-2".into())),
+        // Native resolution, 60 fps, near-visually-lossless crf. Big files.
+        "vhigh" => (60, 15, None),
         _ => (30, 23, None), // high: native resolution
     }
 }
@@ -876,7 +879,7 @@ fn start_recording(
     // The overlay can pick quality per-recording; fall back to the saved setting.
     let (fps, crf, scale) = {
         let q = quality
-            .filter(|q| q == "low" || q == "high")
+            .filter(|q| q == "low" || q == "high" || q == "vhigh")
             .unwrap_or_else(|| state.settings.lock().unwrap().video_quality.clone());
         quality_params(&q)
     };

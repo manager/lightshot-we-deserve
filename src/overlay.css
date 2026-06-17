@@ -140,6 +140,15 @@ html, body {
 #actionbar #recordBtn:hover { background: #d94535; }
 #actionbar #closeBtn { background: #5a2b2b; }
 #actionbar #closeBtn:hover { background: #7a3636; }
+#actionbar #qualitySel {
+  border: none;
+  border-radius: 5px;
+  background: #3d3d3d;
+  color: #fff;
+  font-size: 13px;
+  padding: 6px 8px;
+  cursor: pointer;
+}
 
 #nameModal {
   position: fixed;
