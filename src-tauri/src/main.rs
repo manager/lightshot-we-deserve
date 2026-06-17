@@ -783,8 +783,10 @@ fn cancel_area(app: AppHandle) {
 // never appears in the video.
 #[tauri::command]
 fn start_recording(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> Result<(), String> {
+    log(&format!("start_recording requested: x={x} y={y} w={w} h={h}"));
     let state = app.state::<AppState>();
     if state.recording.lock().unwrap().is_some() {
+        log("start_recording rejected: already recording");
         return Err("already recording".into());
     }
 
@@ -806,6 +808,7 @@ fn start_recording(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> Result<(),
     let out = dir.join(video_name());
     let out_str = out.to_string_lossy().to_string();
     let ffmpeg = resolve_ffmpeg(&app);
+    log(&format!("ffmpeg path: {}", ffmpeg.display()));
 
     let mut args: Vec<String> = vec![
         "-y".into(),
@@ -859,9 +862,11 @@ fn start_recording(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> Result<(),
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("ffmpeg spawn failed ({}): {e}", ffmpeg.display()))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        let m = format!("ffmpeg spawn failed ({}): {e}", ffmpeg.display());
+        log(&m);
+        m
+    })?;
     let mut stdin = child.stdin.take().ok_or("ffmpeg stdin unavailable")?;
 
     // ffmpeg launched OK -> dismiss the overlay and show the indicator before
