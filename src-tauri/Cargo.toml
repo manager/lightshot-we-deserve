@@ -1,6 +1,6 @@
 [package]
 name = "lightshot-we-deserve"
-version = "0.9.4"
+version = "0.9.5"
 description = "The Lightshot we deserve - a clean screenshot tool"
 authors = ["manager <alexanyanwolf@gmail.com>"]
 edition = "2021"
