@@ -938,15 +938,15 @@ fn start_recording(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> Result<(),
     };
     log("ffmpeg stdin acquired");
 
-    // ffmpeg launched OK -> dismiss the overlay and show the recording UI before
-    // the capture thread takes its first frame.
-    hide_overlay(&app);
-    show_record_ui(&app, ax, ay, w, h);
-
+    // Start grabbing frames immediately. The capture thread owns ffmpeg's stdin
+    // and child process, so the recording runs to completion independently of the
+    // indicator windows. The overlay is hidden and the border/Stop bar are shown
+    // AFTER this, as best-effort UI: if any of that misbehaves, video still records.
     let stop = Arc::new(AtomicBool::new(false));
     let stop_t = stop.clone();
     let app_t = app.clone();
     let handle = std::thread::spawn(move || {
+        log("capture thread running");
         // Let the overlay actually disappear from the compositor first.
         std::thread::sleep(std::time::Duration::from_millis(300));
         let frame_bytes = (w as usize) * (h as usize) * 4;
@@ -969,6 +969,9 @@ fn start_recording(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> Result<(),
                 if stdin.write_all(&buf).is_err() {
                     ffmpeg_died = true;
                     break;
+                }
+                if written == 0 {
+                    log("first frame written");
                 }
                 written += 1;
             }
@@ -1016,6 +1019,15 @@ fn start_recording(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> Result<(),
         stop,
         handle: Some(handle),
     });
+    log("capture thread spawned");
+
+    // Best-effort indicator UI. Recording is already underway above, so even if
+    // these calls stall the command thread, frames keep flowing.
+    log("hiding overlay");
+    hide_overlay(&app);
+    log("showing record ui");
+    show_record_ui(&app, ax, ay, w, h);
+
     log(&format!(
         "recording started -> {} ({w}x{h} @ {fps}fps, crf {crf})",
         out.display()
