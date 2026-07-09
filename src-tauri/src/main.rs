@@ -266,9 +266,24 @@ fn grab_frozen_once(force: bool) -> Result<Option<Frozen>, String> {
     for m in &monitors {
         let x = m.x().unwrap_or(0);
         let y = m.y().unwrap_or(0);
-        layout.push((x, y, m.width().unwrap_or(0), m.height().unwrap_or(0)));
+        let (w, h) = (m.width().unwrap_or(0), m.height().unwrap_or(0));
+        layout.push((x, y, w, h));
         match m.capture_image() {
-            Ok(img) => placed.push((x, y, img)),
+            Ok(img) => {
+                // A frame whose size disagrees with what the monitor reports is
+                // the "squeezed" capture Windows hands out while the display is
+                // still re-initializing after wake/dock — reject the attempt so
+                // the caller retries once it settles.
+                if !force && w != 0 && h != 0 && (img.width() != w || img.height() != h) {
+                    log(&format!(
+                        "monitor at ({x},{y}) reports {w}x{h} but frame is {}x{}; unsettled",
+                        img.width(),
+                        img.height()
+                    ));
+                    return Ok(None);
+                }
+                placed.push((x, y, img));
+            }
             Err(e) => log(&format!("monitor capture failed at ({x},{y}): {e}")),
         }
     }
@@ -342,6 +357,45 @@ fn grab_frozen() -> Result<Frozen, String> {
     }
     log("monitor layout never settled; taking a best-effort capture");
     grab_frozen_once(true)?.ok_or_else(|| "forced capture produced no frame".to_string())
+}
+
+// Windows brings a display up lazily after wake / re-dock: the first capture is
+// what forces the re-init (the visible screen "squeeze"), and that capture comes
+// back at the stale resolution — which is why the first screenshot after sleep
+// or re-attaching a monitor never worked. Watch the layout from a background
+// thread and take a throwaway capture as soon as it settles after a change, so
+// the init cost is paid right away instead of at the user's next hotkey press.
+fn spawn_display_watcher(app: AppHandle) {
+    std::thread::spawn(move || {
+        let mut last = monitor_layout().unwrap_or_default();
+        // Startup counts too: the very first capture of a session pays the same
+        // init cost, so warm up once immediately.
+        let mut pending = true;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            let now = match monitor_layout() {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if now != last {
+                last = now;
+                pending = true;
+                continue; // still moving — warm up only after two reads agree
+            }
+            if pending {
+                // A full-desktop grab mid-recording could hiccup the video;
+                // leave it pending and retry after the recording ends.
+                if app.state::<AppState>().recording.lock().unwrap().is_some() {
+                    continue;
+                }
+                pending = false;
+                match grab_frozen_once(true) {
+                    Ok(_) => log("display warm-up capture done"),
+                    Err(e) => log(&format!("display warm-up capture failed: {e}")),
+                }
+            }
+        }
+    });
 }
 
 fn decode_png_data_url(s: &str) -> Result<Vec<u8>, String> {
@@ -1246,6 +1300,7 @@ fn run() {
             apply_autostart(&handle, want_autostart);
             create_indicator_windows(&handle);
             create_overlay_window(&handle);
+            spawn_display_watcher(handle.clone());
             log("setup complete");
             Ok(())
         })
