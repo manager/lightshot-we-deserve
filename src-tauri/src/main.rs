@@ -115,20 +115,31 @@ fn store_settings(s: &Settings) -> Result<(), String> {
 // via a custom URI scheme so the multi-MB image never crosses the JSON IPC bridge
 // (base64 + giant-string transfer was the capture-latency culprit). BMP skips the
 // PNG compression pass entirely — lossless and faster to encode.
-struct Frozen {
+// One frozen monitor. Each monitor keeps its own 1:1 frame and gets its own
+// overlay window: a single image stitched across monitors can only be right
+// for one DPI scale factor, so mixed-DPI setups (100/125/150%) would misalign
+// the selection on every non-primary screen.
+struct FrozenShot {
     bytes: Vec<u8>,
-    // Virtual-desktop origin of the shot. The overlay is positioned from THESE
-    // coordinates, not from a fresh monitor query: if the layout changed
-    // between grab and show, stretching the image to new bounds garbles it.
+    // Virtual-desktop origin of this monitor. The overlay windows are
+    // positioned from THESE coordinates, not from a fresh monitor query: if
+    // the layout changed between grab and show, sizing to new bounds would
+    // stretch the old image across them.
     x: i32,
     y: i32,
     width: u32,
     height: u32,
+}
+
+struct Frozen {
+    shots: Vec<FrozenShot>,
     nonce: u64,
 }
 
 #[derive(Serialize, Clone)]
 struct FrozenInfo {
+    x: i32,
+    y: i32,
     url: String,
     width: u32,
     height: u32,
@@ -377,39 +388,30 @@ fn grab_frozen_once(force: bool) -> Result<Option<Frozen>, String> {
         return Ok(None);
     }
 
-    // Bounds derived from the frames we actually captured (their real pixel
-    // sizes), so a screen can never be clipped or overlapped in the stitch.
-    let (mut min_x, mut min_y) = (i32::MAX, i32::MAX);
-    let (mut max_x, mut max_y) = (i32::MIN, i32::MIN);
-    for (x, y, img) in &placed {
-        min_x = min_x.min(*x);
-        min_y = min_y.min(*y);
-        max_x = max_x.max(*x + img.width() as i32);
-        max_y = max_y.max(*y + img.height() as i32);
+    // One shot per monitor, kept at its native pixel size. Uncompressed BMP:
+    // the blob is only displayed in the overlay, so we skip the PNG
+    // compression pass entirely: lossless and the fastest encode available.
+    let mut shots = Vec::new();
+    for (x, y, img) in placed {
+        let (w, h) = (img.width(), img.height());
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            use image::ImageEncoder;
+            image::codecs::bmp::BmpEncoder::new(&mut buf)
+                .write_image(img.as_raw(), w, h, image::ExtendedColorType::Rgba8)
+                .map_err(|e| format!("bmp encode failed: {e}"))?;
+        }
+        shots.push(FrozenShot {
+            bytes: buf.into_inner(),
+            x,
+            y,
+            width: w,
+            height: h,
+        });
     }
-    let (vw, vh) = ((max_x - min_x) as u32, (max_y - min_y) as u32);
-
-    let mut canvas = image::RgbaImage::new(vw, vh);
-    for (x, y, img) in &placed {
-        image::imageops::replace(&mut canvas, img, (*x - min_x) as i64, (*y - min_y) as i64);
-    }
-
-    // Uncompressed BMP: the blob is only displayed in the overlay, so we skip the
-    // PNG compression pass entirely — lossless and the fastest encode available.
-    let mut buf = std::io::Cursor::new(Vec::new());
-    {
-        use image::ImageEncoder;
-        image::codecs::bmp::BmpEncoder::new(&mut buf)
-            .write_image(canvas.as_raw(), vw, vh, image::ExtendedColorType::Rgba8)
-            .map_err(|e| format!("bmp encode failed: {e}"))?;
-    }
-    log(&format!("frozen virtual desktop {vw}x{vh} at ({min_x},{min_y})"));
+    log(&format!("frozen {} monitor frame(s)", shots.len()));
     Ok(Some(Frozen {
-        bytes: buf.into_inner(),
-        x: min_x,
-        y: min_y,
-        width: vw,
-        height: vh,
+        shots,
         nonce: next_nonce(),
     }))
 }
@@ -885,15 +887,17 @@ fn begin_area_capture(app: &AppHandle) {
     });
 }
 
-// Build the area-selection overlay once, hidden, at startup. Creating the
-// webview the first time a hotkey fires makes the screen flash on that first
-// capture; pre-creating it means the window already exists and only needs to be
-// filled with the frozen frame and shown — seamless from the very first press.
-fn create_overlay_window(app: &AppHandle) {
-    if app.get_webview_window("overlay").is_some() {
-        return;
-    }
-    match WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("overlay.html".into()))
+// One selection overlay per monitor, labeled overlay-0..N-1. Each window shows
+// its own monitor's 1:1 frame, which keeps mixed-DPI setups pixel-accurate.
+// The JS derives its shot index from the window label.
+const OVERLAY_PREFIX: &str = "overlay-";
+
+fn overlay_label(i: usize) -> String {
+    format!("{OVERLAY_PREFIX}{i}")
+}
+
+fn build_overlay_window(app: &AppHandle, i: usize) -> Option<tauri::WebviewWindow> {
+    match WebviewWindowBuilder::new(app, overlay_label(i), WebviewUrl::App("overlay.html".into()))
         .title("Select area")
         .decorations(false)
         .transparent(true)
@@ -904,72 +908,76 @@ fn create_overlay_window(app: &AppHandle) {
         .visible(false)
         .build()
     {
-        Ok(_) => log("overlay window pre-created"),
-        Err(e) => log(&format!("overlay pre-create failed: {e}")),
+        Ok(w) => Some(w),
+        Err(e) => {
+            log(&format!("overlay {i} build failed: {e}"));
+            None
+        }
+    }
+}
+
+// Build the overlay windows once, hidden, at startup. Creating a webview the
+// first time a hotkey fires makes the screen flash on that first capture;
+// pre-creating means the windows already exist and only need to be filled with
+// the frozen frame and shown, seamless from the very first press.
+fn create_overlay_windows(app: &AppHandle) {
+    let count = xcap::Monitor::all().map(|m| m.len()).unwrap_or(1).max(1);
+    for i in 0..count {
+        if app.get_webview_window(&overlay_label(i)).is_none()
+            && build_overlay_window(app, i).is_some()
+        {
+            log(&format!("overlay window {i} pre-created"));
+        }
     }
 }
 
 fn show_overlay(app: &AppHandle) {
-    // Position from the frozen shot itself, not a fresh monitor query: if the
-    // layout changed between grab and show, sizing the window to the NEW
-    // bounds would stretch the old image across them.
-    let geom = app
+    let geoms: Vec<(i32, i32, u32, u32)> = app
         .state::<AppState>()
         .frozen
         .lock()
         .unwrap()
         .as_ref()
-        .map(|f| (f.x, f.y, f.width, f.height));
-    let geom = match geom {
-        Some(g) => Ok(g),
-        None => virtual_bounds(), // no frozen shot (shouldn't happen); best effort
-    };
-    if let Some(w) = app.get_webview_window("overlay") {
-        // Borrow, not move: the fallback branch below still needs `geom`.
-        if let Ok(&(x, y, vw, vh)) = geom.as_ref() {
-            let _ = w.set_position(PhysicalPosition::new(x, y));
-            let _ = w.set_size(PhysicalSize::new(vw, vh));
-        }
-        // Stay hidden until JS has rendered the frozen frame, then it calls
-        // `overlay_ready` to reveal — avoids the dim appearing a beat late.
-        let _ = w.emit("frozen-ready", ());
+        .map(|f| f.shots.iter().map(|s| (s.x, s.y, s.width, s.height)).collect())
+        .unwrap_or_default();
+    if geoms.is_empty() {
+        log("show_overlay: no frozen shots");
         return;
     }
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         let app = handle;
-        match WebviewWindowBuilder::new(&app, "overlay", WebviewUrl::App("overlay.html".into()))
-            .title("Select area")
-            .decorations(false)
-            .transparent(true)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .resizable(false)
-            .shadow(false)
-            .visible(false)
-            .build()
-        {
-            Ok(win) => {
-                match geom {
-                    Ok((x, y, w, h)) => {
-                        let _ = win.set_position(PhysicalPosition::new(x, y));
-                        let _ = win.set_size(PhysicalSize::new(w, h));
-                    }
-                    Err(e) => log(&format!("overlay geometry unavailable: {e}")),
-                }
-                // Built hidden; JS reveals it via `overlay_ready` once the
-                // frozen frame is painted, so dim + crosshair appear together.
-                let _ = win.emit("frozen-ready", ());
-                log("overlay prepared");
-            }
-            Err(e) => log(&format!("overlay build failed: {e}")),
+        for (i, &(x, y, w, h)) in geoms.iter().enumerate() {
+            let win = match app.get_webview_window(&overlay_label(i)) {
+                Some(w) => Some(w),
+                // A monitor was attached after startup; build its window now.
+                None => build_overlay_window(&app, i),
+            };
+            let win = match win {
+                Some(w) => w,
+                None => continue,
+            };
+            let _ = win.set_position(PhysicalPosition::new(x, y));
+            let _ = win.set_size(PhysicalSize::new(w, h));
         }
+        // A monitor may have disappeared since the last capture; make sure the
+        // extra windows stay out of the way.
+        let mut i = geoms.len();
+        while let Some(win) = app.get_webview_window(&overlay_label(i)) {
+            let _ = win.hide();
+            i += 1;
+        }
+        // Each overlay stays hidden until its JS has painted its own frame and
+        // called `overlay_ready`, so the dim never appears a beat late.
+        let _ = app.emit("frozen-ready", ());
     });
 }
 
 fn hide_overlay(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("overlay") {
-        let _ = w.hide();
+    for (label, win) in app.webview_windows() {
+        if label.starts_with(OVERLAY_PREFIX) {
+            let _ = win.hide();
+        }
     }
     *app.state::<AppState>().frozen.lock().unwrap() = None;
 }
@@ -1182,13 +1190,24 @@ fn save_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> 
 }
 
 #[tauri::command]
-fn get_frozen(state: State<AppState>) -> Option<FrozenInfo> {
+fn get_frozen(state: State<AppState>, idx: usize) -> Option<FrozenInfo> {
     let guard = state.frozen.lock().unwrap();
-    guard.as_ref().map(|f| FrozenInfo {
-        url: format!("http://frozen.localhost/{}.bmp", f.nonce),
-        width: f.width,
-        height: f.height,
+    let f = guard.as_ref()?;
+    let s = f.shots.get(idx)?;
+    Some(FrozenInfo {
+        url: format!("http://frozen.localhost/{}/{idx}.bmp", f.nonce),
+        x: s.x,
+        y: s.y,
+        width: s.width,
+        height: s.height,
     })
+}
+
+// A selection can only live on one monitor at a time: when the user starts
+// dragging on one overlay, the others clear theirs.
+#[tauri::command]
+fn claim_overlay(app: AppHandle, idx: usize) {
+    let _ = app.emit("overlay-claimed", idx);
 }
 
 #[tauri::command]
@@ -1233,10 +1252,22 @@ fn copy_capture(app: AppHandle, request: tauri::ipc::Request) -> Result<(), Stri
 }
 
 #[tauri::command]
-fn overlay_ready(app: AppHandle) {
-    if let Some(w) = app.get_webview_window("overlay") {
-        let _ = w.show();
-        let _ = w.set_focus();
+fn overlay_ready(window: tauri::WebviewWindow) {
+    let _ = window.show();
+    // Only the overlay under the mouse takes focus, so Esc and Ctrl+Z go where
+    // the user is. If the cursor can't be read, take focus anyway rather than
+    // leave the keyboard dead.
+    let focus = match (cursor_pos(), window.outer_position(), window.outer_size()) {
+        (Some((cx, cy)), Ok(pos), Ok(size)) => {
+            cx >= pos.x
+                && cx < pos.x + size.width as i32
+                && cy >= pos.y
+                && cy < pos.y + size.height as i32
+        }
+        _ => true,
+    };
+    if focus {
+        let _ = window.set_focus();
     }
 }
 
@@ -1246,10 +1277,10 @@ fn cancel_area(app: AppHandle) {
     hide_overlay(&app);
 }
 
-// Begin recording the selected region. (x, y, w, h) are physical px relative to
-// the virtual-desktop origin (the overlay's top-left), matching the frozen frame
-// the user selected on. The overlay is dismissed before the first frame so it
-// never appears in the video.
+// Begin recording the selected region. (x, y, w, h) are absolute physical px
+// in virtual-desktop space, matching the frozen frame the user selected on.
+// The overlay is dismissed before the first frame so it never appears in the
+// video.
 #[tauri::command]
 fn start_recording(
     app: AppHandle,
@@ -1270,9 +1301,10 @@ fn start_recording(
     let w = (w & !1).max(2);
     let h = (h & !1).max(2);
 
-    let (vx, vy, _, _) = virtual_bounds()?;
-    let ax = vx + x;
-    let ay = vy + y;
+    // (x, y) already arrive as absolute virtual-desktop physical coordinates:
+    // each overlay adds its own monitor's origin before invoking.
+    let ax = x;
+    let ay = y;
 
     // The overlay can pick quality per-recording; fall back to the saved setting.
     let (fps, crf, scale) = {
@@ -1547,16 +1579,26 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 fn run() {
     log("=== lightshot-we-deserve launching ===");
     tauri::Builder::default()
-        .register_uri_scheme_protocol("frozen", |ctx, _req| {
+        .register_uri_scheme_protocol("frozen", |ctx, req| {
             let app = ctx.app_handle();
             let guard = app.state::<AppState>();
             let frozen = guard.frozen.lock().unwrap();
-            match frozen.as_ref() {
-                Some(f) => tauri::http::Response::builder()
+            // Path shape: /{nonce}/{idx}.bmp. The nonce busts the webview
+            // cache per capture, the index picks the monitor's shot.
+            let idx = req
+                .uri()
+                .path()
+                .rsplit('/')
+                .next()
+                .and_then(|seg| seg.strip_suffix(".bmp"))
+                .and_then(|s| s.parse::<usize>().ok());
+            let shot = idx.and_then(|i| frozen.as_ref().and_then(|f| f.shots.get(i)));
+            match shot {
+                Some(s) => tauri::http::Response::builder()
                     .header("Content-Type", "image/bmp")
                     .header("Cache-Control", "no-store")
                     .header("Access-Control-Allow-Origin", "*")
-                    .body(f.bytes.clone())
+                    .body(s.bytes.clone())
                     .unwrap(),
                 None => tauri::http::Response::builder()
                     .status(404)
@@ -1616,6 +1658,7 @@ fn run() {
             save_capture,
             copy_capture,
             overlay_ready,
+            claim_overlay,
             cancel_area,
             start_recording,
             stop_recording,
@@ -1638,7 +1681,7 @@ fn run() {
             let want_autostart = handle.state::<AppState>().settings.lock().unwrap().autostart;
             apply_autostart(&handle, want_autostart);
             create_indicator_windows(&handle);
-            create_overlay_window(&handle);
+            create_overlay_windows(&handle);
             spawn_display_watcher(handle.clone());
             spawn_session_watcher();
             log("setup complete");

@@ -1,6 +1,19 @@
 const { invoke } = window.__TAURI__.core;
 const listen = window.__TAURI__.event && window.__TAURI__.event.listen;
 
+// One overlay window per monitor; the shot index comes from the window label
+// ("overlay-0", "overlay-1", ...). Each window only ever shows its own
+// monitor's 1:1 frame, which keeps mixed-DPI setups pixel-accurate.
+const IDX = (() => {
+  try {
+    const label = window.__TAURI__.webviewWindow.getCurrentWebviewWindow().label;
+    const n = parseInt(label.split("-").pop(), 10);
+    return Number.isFinite(n) ? n : 0;
+  } catch (_) {
+    return 0;
+  }
+})();
+
 const canvas = document.getElementById("c");
 const ctx = canvas.getContext("2d");
 const hint = document.getElementById("hint");
@@ -14,6 +27,7 @@ const COLORS = ["#e7402e", "#e67e22", "#f1c40f", "#2ecc71", "#3498db", "#9b59b6"
 
 const frozenImg = new Image();
 let frozenNatW = 0, frozenNatH = 0;
+let frozenX = 0, frozenY = 0;  // this monitor's origin in virtual-desktop px
 let cssW = 0, cssH = 0, dpr = 1, sx = 1, sy = 1;
 
 // Pre-rendered static background (frozen image + dim). Built once per resize,
@@ -51,7 +65,8 @@ async function loadFrozen() {
   ready = false;
   clearCanvasHard();           // wipe any leftover frame from a previous capture
   let shot;
-  try { shot = await invoke("get_frozen"); } catch (_) { return; }
+  try { shot = await invoke("get_frozen", { idx: IDX }); } catch (_) { return; }
+  // No shot for this window (fewer monitors than windows): stay hidden.
   if (!shot) return;
   await new Promise((res) => {
     frozenImg.onload = res;
@@ -61,6 +76,8 @@ async function loadFrozen() {
   });
   frozenNatW = shot.width;
   frozenNatH = shot.height;
+  frozenX = shot.x;
+  frozenY = shot.y;
   resetState();
   ready = true;
   resize();
@@ -415,6 +432,9 @@ canvas.addEventListener("mousedown", (e) => {
     selStart = pt;
     sel = { x: pt.x, y: pt.y, w: 0, h: 0 };
     hint.style.display = "none";
+    // Tell the other monitors' overlays to drop their selection: only one
+    // monitor can own the selection at a time.
+    invoke("claim_overlay", { idx: IDX }).catch(() => {});
     positionUI();
     render();
     return;
@@ -449,7 +469,9 @@ window.addEventListener("mousemove", (e) => {
     canvas.style.cursor = (tool === null && sel && insideSel(pt)) ? "move" : "";
   }
   if (selecting) {
-    sel = normRect(selStart.x, selStart.y, pt.x, pt.y);
+    // Clamp to this window: with the button held the OS keeps sending moves
+    // even after the cursor crosses onto another monitor.
+    sel = normRect(selStart.x, selStart.y, clamp(pt.x, 0, cssW), clamp(pt.y, 0, cssH));
     render();
     return;
   }
@@ -668,8 +690,9 @@ async function doCopy() {
 async function doRecord() {
   if (!sel) return;
   if (textInput) commitText();
-  const x = Math.round(sel.x * sx);
-  const y = Math.round(sel.y * sy);
+  // Absolute virtual-desktop coordinates: this monitor's origin + selection.
+  const x = frozenX + Math.round(sel.x * sx);
+  const y = frozenY + Math.round(sel.y * sy);
   const w = Math.round(sel.w * sx);
   const h = Math.round(sel.h * sy);
   if (w < 8 || h < 8) return;
@@ -726,6 +749,32 @@ window.addEventListener("resize", resize);
 
 // ---------- init ----------
 
+// Another monitor's overlay took the selection: clear ours but keep showing
+// the dim + frozen frame (unlike resetState, which is a full between-captures
+// reset).
+function clearLocal() {
+  sel = null;
+  tool = null;
+  committed = [];
+  undoable = [];
+  current = null;
+  selecting = false;
+  drawing = false;
+  moving = false;
+  cancelText();
+  setTool(null);
+  hint.style.display = "";
+  hideBadge();
+  if (nameModal) nameModal.classList.add("hidden");
+  positionUI();
+  render();
+}
+
 buildSwatches();
-if (listen) listen("frozen-ready", () => loadFrozen());
+if (listen) {
+  listen("frozen-ready", () => loadFrozen());
+  listen("overlay-claimed", (e) => {
+    if (e.payload !== IDX) clearLocal();
+  });
+}
 loadFrozen();
