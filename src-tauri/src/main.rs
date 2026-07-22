@@ -2,7 +2,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -138,6 +138,10 @@ struct Frozen {
 
 #[derive(Serialize, Clone)]
 struct FrozenInfo {
+    // Capture id. The overlay hands it back in overlay_ready so a stale async
+    // load (finishing after Escape or after a newer capture) can be ignored
+    // instead of re-showing a dismissed window.
+    nonce: u64,
     x: i32,
     y: i32,
     url: String,
@@ -210,6 +214,26 @@ fn custom_name(name: &str) -> String {
     }
 }
 
+// Never overwrite an existing file: two shots inside one second share a
+// timestamp name, and user-typed names repeat. "name.png" -> "name (2).png".
+fn unique_path(dir: &Path, file_name: &str) -> PathBuf {
+    let first = dir.join(file_name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match file_name.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{e}")),
+        None => (file_name.to_string(), String::new()),
+    };
+    for n in 2u32.. {
+        let cand = dir.join(format!("{stem} ({n}){ext}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    unreachable!()
+}
+
 fn primary_monitor() -> Result<xcap::Monitor, String> {
     let monitors = xcap::Monitor::all().map_err(|e| format!("Monitor::all failed: {e}"))?;
     monitors
@@ -271,14 +295,12 @@ fn full_capture_monitor() -> Result<xcap::Monitor, String> {
     primary_monitor()
 }
 
-fn capture_full(dir: &PathBuf) -> Result<String, String> {
-    let _guard = CAPTURE_LOCK.lock().unwrap();
-    warm_up_if_dirty("full capture");
-    // Same anti-glitch discipline the area capture has: a frame whose size
-    // disagrees with the monitor is the squeezed mid-re-init capture Windows
-    // hands out after wake/unlock. Retry until it settles; on the last attempt
-    // accept whatever we get rather than fail the hotkey outright.
-    const MAX_ATTEMPTS: u32 = 10;
+// Same anti-glitch discipline the area capture has: a frame whose size
+// disagrees with the monitor is the squeezed mid-re-init capture Windows
+// hands out after wake/unlock. Retry until it settles; on the last attempt
+// accept whatever we get rather than fail the hotkey outright.
+fn capture_full_image() -> Result<image::RgbaImage, String> {
+    const MAX_ATTEMPTS: u32 = 15;
     let mut image = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let monitor = full_capture_monitor()?;
@@ -307,11 +329,28 @@ fn capture_full(dir: &PathBuf) -> Result<String, String> {
                 log(&format!("full capture failed ({e}); retrying"));
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(120));
+        std::thread::sleep(std::time::Duration::from_millis(150));
     }
-    let image = image.ok_or_else(|| "no frame captured".to_string())?;
+    image.ok_or_else(|| "no frame captured".to_string())
+}
+
+fn capture_full(dir: &PathBuf) -> Result<String, String> {
+    let _guard = CAPTURE_LOCK.lock().unwrap();
+    // Same mid-capture staleness guard as the area path: if a display event
+    // lands while the frame is being taken, retake it.
+    let mut rounds = 0;
+    let image = loop {
+        rounds += 1;
+        let gen_before = DIRTY_GEN.load(Ordering::SeqCst);
+        warm_up_if_dirty("full capture");
+        let img = capture_full_image()?;
+        if DIRTY_GEN.load(Ordering::SeqCst) == gen_before || rounds >= 3 {
+            break img;
+        }
+        log("display changed mid-capture; retaking the shot");
+    };
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let path = dir.join(timestamp_name());
+    let path = unique_path(dir, &timestamp_name());
     image
         .save(&path)
         .map_err(|e| format!("save failed: {e}"))?;
@@ -448,19 +487,22 @@ fn warm_up_if_dirty(context: &str) {
     match grab_frozen_once(true) {
         // Store the generation read BEFORE the grab: an event that lands
         // mid-grab keeps the display dirty instead of being lost.
-        Ok(_) => CLEAN_GEN.store(dirty, Ordering::SeqCst),
+        Ok(_) => {
+            CLEAN_GEN.store(dirty, Ordering::SeqCst);
+            // The throwaway is what forces the display re-init; give Windows
+            // a beat to finish it before the caller takes the real frame.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         Err(e) => log(&format!("warm-up frame failed: {e}")),
     }
 }
 
-fn grab_frozen() -> Result<Frozen, String> {
-    let _guard = CAPTURE_LOCK.lock().unwrap();
-    warm_up_if_dirty("area capture");
-    // After waking from sleep or (re)attaching a dock, Windows reports a shifting
-    // monitor layout for up to ~1s; a capture taken then looks "caught mid-resize".
-    // Retry until the layout reads stable, then fall back to a forced grab so a
-    // screenshot is never blocked outright.
-    const MAX_ATTEMPTS: u32 = 10;
+// After waking from sleep or (re)attaching a dock, Windows reports a shifting
+// monitor layout for up to ~1s; a capture taken then looks "caught mid-resize".
+// Retry until the layout reads stable, then fall back to a forced grab so a
+// screenshot is never blocked outright.
+fn grab_frozen_settled() -> Result<Frozen, String> {
+    const MAX_ATTEMPTS: u32 = 15;
     for attempt in 1..=MAX_ATTEMPTS {
         match grab_frozen_once(false) {
             Ok(Some(frozen)) => {
@@ -474,10 +516,29 @@ fn grab_frozen() -> Result<Frozen, String> {
             )),
             Err(e) => return Err(e),
         }
-        std::thread::sleep(std::time::Duration::from_millis(120));
+        std::thread::sleep(std::time::Duration::from_millis(150));
     }
     log("monitor layout never settled; taking a best-effort capture");
     grab_frozen_once(true)?.ok_or_else(|| "forced capture produced no frame".to_string())
+}
+
+fn grab_frozen() -> Result<Frozen, String> {
+    let _guard = CAPTURE_LOCK.lock().unwrap();
+    // A display event (unlock, re-plug) can land WHILE the shot is being taken;
+    // that frame can be stale even though every settle check passed when it
+    // started. Snapshot the generation first and redo the whole shot (warm-up
+    // included) if it moved. Bounded so the hotkey always answers.
+    let mut rounds = 0;
+    loop {
+        rounds += 1;
+        let gen_before = DIRTY_GEN.load(Ordering::SeqCst);
+        warm_up_if_dirty("area capture");
+        let shot = grab_frozen_settled()?;
+        if DIRTY_GEN.load(Ordering::SeqCst) == gen_before || rounds >= 3 {
+            return Ok(shot);
+        }
+        log("display changed mid-capture; retaking the shot");
+    }
 }
 
 // Windows brings a display up lazily after wake / re-dock: the first capture is
@@ -566,6 +627,8 @@ fn spawn_session_watcher() {
             lp: LPARAM,
         ) -> LRESULT {
             const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+            const WM_DEVICECHANGE: u32 = 0x0219;
+            const DBT_DEVNODES_CHANGED: WPARAM = 0x0007;
             const WTS_CONSOLE_CONNECT: WPARAM = 0x1;
             const WTS_SESSION_UNLOCK: WPARAM = 0x8;
             const PBT_APMRESUMESUSPEND: WPARAM = 0x7;
@@ -589,6 +652,14 @@ fn spawn_session_watcher() {
                 WM_DISPLAYCHANGE => {
                     mark_display_dirty("display change broadcast");
                     0
+                }
+                // Device arrival/removal. A fast HDMI reconnect at the same
+                // resolution can slip past WM_DISPLAYCHANGE; the device-change
+                // broadcast still fires. False positives (USB sticks etc.)
+                // only cost one background warm-up frame.
+                WM_DEVICECHANGE if wp == DBT_DEVNODES_CHANGED => {
+                    mark_display_dirty("device change broadcast");
+                    1
                 }
                 _ => DefWindowProcW(hwnd, msg, wp, lp),
             }
@@ -931,15 +1002,88 @@ fn create_overlay_windows(app: &AppHandle) {
     }
 }
 
+// Readiness barrier for one capture: every overlay window reports in once its
+// frame is painted, and they are all revealed together. Without it one monitor
+// pops while another is still loading (or broken and never shows at all).
+struct OverlayBarrier {
+    nonce: u64,          // capture this barrier belongs to; 0 = none
+    eligible: Vec<usize>, // windows that were positioned successfully
+    ready: Vec<usize>,   // windows whose JS reported painted
+    shown: bool,
+}
+
+static OVERLAY_BARRIER: Mutex<OverlayBarrier> = Mutex::new(OverlayBarrier {
+    nonce: 0,
+    eligible: Vec::new(),
+    ready: Vec::new(),
+    shown: false,
+});
+
+// Reveal every painted overlay of this capture at once, focusing the one under
+// the cursor. The timeout path fires even if not everyone reported, so one
+// broken monitor can't hold the rest hostage forever.
+fn reveal_overlays(app: &AppHandle, nonce: u64, timeout: bool) {
+    let ready: Vec<usize> = {
+        let mut b = OVERLAY_BARRIER.lock().unwrap();
+        if b.nonce != nonce || b.shown {
+            return;
+        }
+        if timeout {
+            if b.ready.is_empty() {
+                log("overlay barrier timeout with nothing ready; keeping hidden");
+                return;
+            }
+            log(&format!(
+                "overlay barrier timeout: revealing {}/{} windows",
+                b.ready.len(),
+                b.eligible.len()
+            ));
+        }
+        b.shown = true;
+        b.ready.clone()
+    };
+    let cursor = cursor_pos();
+    let mut focused = false;
+    for i in &ready {
+        if let Some(win) = app.get_webview_window(&overlay_label(*i)) {
+            let _ = win.show();
+            let inside = match (cursor, win.outer_position(), win.outer_size()) {
+                (Some((cx, cy)), Ok(pos), Ok(size)) => {
+                    cx >= pos.x
+                        && cx < pos.x + size.width as i32
+                        && cy >= pos.y
+                        && cy < pos.y + size.height as i32
+                }
+                _ => false,
+            };
+            if inside {
+                let _ = win.set_focus();
+                focused = true;
+            }
+        }
+    }
+    if !focused {
+        // Keyboard must land somewhere or Esc goes dead; fall back to the first.
+        if let Some(win) = ready
+            .first()
+            .and_then(|i| app.get_webview_window(&overlay_label(*i)))
+        {
+            let _ = win.set_focus();
+        }
+    }
+}
+
 fn show_overlay(app: &AppHandle) {
-    let geoms: Vec<(i32, i32, u32, u32)> = app
-        .state::<AppState>()
-        .frozen
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|f| f.shots.iter().map(|s| (s.x, s.y, s.width, s.height)).collect())
-        .unwrap_or_default();
+    let (nonce, geoms): (u64, Vec<(i32, i32, u32, u32)>) = {
+        let guard = app.state::<AppState>().frozen.lock().unwrap();
+        match guard.as_ref() {
+            Some(f) => (
+                f.nonce,
+                f.shots.iter().map(|s| (s.x, s.y, s.width, s.height)).collect(),
+            ),
+            None => (0, Vec::new()),
+        }
+    };
     if geoms.is_empty() {
         log("show_overlay: no frozen shots");
         return;
@@ -947,6 +1091,7 @@ fn show_overlay(app: &AppHandle) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         let app = handle;
+        let mut eligible = Vec::new();
         for (i, &(x, y, w, h)) in geoms.iter().enumerate() {
             let win = match app.get_webview_window(&overlay_label(i)) {
                 Some(w) => Some(w),
@@ -957,8 +1102,16 @@ fn show_overlay(app: &AppHandle) {
                 Some(w) => w,
                 None => continue,
             };
-            let _ = win.set_position(PhysicalPosition::new(x, y));
-            let _ = win.set_size(PhysicalSize::new(w, h));
+            // A window that failed to take its monitor's geometry would show
+            // the wrong content in the wrong place; leave it hidden instead.
+            if win.set_position(PhysicalPosition::new(x, y)).is_err()
+                || win.set_size(PhysicalSize::new(w, h)).is_err()
+            {
+                log(&format!("overlay {i} positioning failed; leaving it hidden"));
+                let _ = win.hide();
+                continue;
+            }
+            eligible.push(i);
         }
         // A monitor may have disappeared since the last capture; make sure the
         // extra windows stay out of the way.
@@ -967,13 +1120,37 @@ fn show_overlay(app: &AppHandle) {
             let _ = win.hide();
             i += 1;
         }
-        // Each overlay stays hidden until its JS has painted its own frame and
-        // called `overlay_ready`, so the dim never appears a beat late.
+        if eligible.is_empty() {
+            log("show_overlay: no overlay window could be positioned");
+            return;
+        }
+        {
+            let mut b = OVERLAY_BARRIER.lock().unwrap();
+            b.nonce = nonce;
+            b.eligible = eligible;
+            b.ready.clear();
+            b.shown = false;
+        }
+        // Every overlay stays hidden until its JS has painted its own frame
+        // and called `overlay_ready`; they are then revealed together.
         let _ = app.emit("frozen-ready", ());
+        // Failsafe: if some webview never reports in, show what's ready.
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            reveal_overlays(&app2, nonce, true);
+        });
     });
 }
 
 fn hide_overlay(app: &AppHandle) {
+    // Invalidate the barrier first so an in-flight load can't re-show a
+    // window after the user dismissed the capture.
+    {
+        let mut b = OVERLAY_BARRIER.lock().unwrap();
+        b.nonce = 0;
+        b.shown = false;
+    }
     for (label, win) in app.webview_windows() {
         if label.starts_with(OVERLAY_PREFIX) {
             let _ = win.hide();
@@ -1162,12 +1339,23 @@ fn apply_autostart(app: &AppHandle, enabled: bool) {
     }
 }
 
+// One full capture at a time: hammering the hotkey used to pile up a queue of
+// threads all waiting on the capture lock.
+static FULL_BUSY: AtomicBool = AtomicBool::new(false);
+
 fn do_full_capture(app: &AppHandle) {
+    if FULL_BUSY.swap(true, Ordering::SeqCst) {
+        log("full capture already in progress; ignoring re-trigger");
+        return;
+    }
     let state = app.state::<AppState>();
     let dir = resolve_save_dir(&state);
-    std::thread::spawn(move || match capture_full(&dir) {
-        Ok(p) => log(&format!("saved full screenshot: {p}")),
-        Err(e) => log(&format!("full capture error: {e}")),
+    std::thread::spawn(move || {
+        match capture_full(&dir) {
+            Ok(p) => log(&format!("saved full screenshot: {p}")),
+            Err(e) => log(&format!("full capture error: {e}")),
+        }
+        FULL_BUSY.store(false, Ordering::SeqCst);
     });
 }
 
@@ -1195,6 +1383,7 @@ fn get_frozen(state: State<AppState>, idx: usize) -> Option<FrozenInfo> {
     let f = guard.as_ref()?;
     let s = f.shots.get(idx)?;
     Some(FrozenInfo {
+        nonce: f.nonce,
         url: format!("http://frozen.localhost/{}/{idx}.bmp", f.nonce),
         x: s.x,
         y: s.y,
@@ -1224,7 +1413,7 @@ fn save_capture(app: AppHandle, request: tauri::ipc::Request) -> Result<String, 
         Some(n) if !n.trim().is_empty() => custom_name(&n),
         _ => timestamp_name(),
     };
-    let path = dir.join(file_name);
+    let path = unique_path(&dir, &file_name);
     fs::write(&path, bytes).map_err(|e| format!("save failed: {e}"))?;
     let p = path.to_string_lossy().to_string();
     log(&format!("saved area screenshot: {p}"));
@@ -1252,23 +1441,37 @@ fn copy_capture(app: AppHandle, request: tauri::ipc::Request) -> Result<(), Stri
 }
 
 #[tauri::command]
-fn overlay_ready(window: tauri::WebviewWindow) {
-    let _ = window.show();
-    // Only the overlay under the mouse takes focus, so Esc and Ctrl+Z go where
-    // the user is. If the cursor can't be read, take focus anyway rather than
-    // leave the keyboard dead.
-    let focus = match (cursor_pos(), window.outer_position(), window.outer_size()) {
-        (Some((cx, cy)), Ok(pos), Ok(size)) => {
-            cx >= pos.x
-                && cx < pos.x + size.width as i32
-                && cy >= pos.y
-                && cy < pos.y + size.height as i32
-        }
-        _ => true,
+fn overlay_ready(app: AppHandle, window: tauri::WebviewWindow, nonce: u64) {
+    let idx = window
+        .label()
+        .strip_prefix(OVERLAY_PREFIX)
+        .and_then(|s| s.parse::<usize>().ok());
+    let idx = match idx {
+        Some(i) => i,
+        None => return,
     };
-    if focus {
-        let _ = window.set_focus();
+    {
+        let mut b = OVERLAY_BARRIER.lock().unwrap();
+        // Stale report: the capture was dismissed or replaced while this
+        // window was still loading. Ignore it, don't re-show anything.
+        if b.nonce != nonce || !b.eligible.contains(&idx) {
+            return;
+        }
+        if !b.ready.contains(&idx) {
+            b.ready.push(idx);
+        }
+        if b.shown {
+            // Barrier already released (timeout path); this straggler just
+            // joins in late.
+            drop(b);
+            let _ = window.show();
+            return;
+        }
+        if b.ready.len() < b.eligible.len() {
+            return;
+        }
     }
+    reveal_overlays(&app, nonce, false);
 }
 
 #[tauri::command]
@@ -1316,7 +1519,7 @@ fn start_recording(
 
     let dir = resolve_save_dir(&state);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let out = dir.join(video_name());
+    let out = unique_path(&dir, &video_name());
     let out_str = out.to_string_lossy().to_string();
     let ffmpeg = resolve_ffmpeg(&app);
     log(&format!("ffmpeg path: {}", ffmpeg.display()));

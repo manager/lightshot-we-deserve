@@ -68,12 +68,15 @@ async function loadFrozen() {
   try { shot = await invoke("get_frozen", { idx: IDX }); } catch (_) { return; }
   // No shot for this window (fewer monitors than windows): stay hidden.
   if (!shot) return;
-  await new Promise((res) => {
-    frozenImg.onload = res;
-    frozenImg.onerror = res;
+  const ok = await new Promise((res) => {
+    frozenImg.onload = () => res(true);
+    frozenImg.onerror = () => res(false);
     frozenImg.crossOrigin = "anonymous"; // keep the canvas untainted for export
     frozenImg.src = shot.url;
   });
+  // A failed load must NOT report ready: showing this window would present a
+  // blank monitor. The backend's barrier timeout reveals the others.
+  if (!ok) return;
   frozenNatW = shot.width;
   frozenNatH = shot.height;
   frozenX = shot.x;
@@ -81,8 +84,9 @@ async function loadFrozen() {
   resetState();
   ready = true;
   resize();
-  // Frame is painted — now reveal the window so dim + crosshair show together.
-  invoke("overlay_ready").catch(() => {});
+  // Frame is painted; report in with the capture id so a stale load (user
+  // already hit Escape, or a newer capture replaced this one) is ignored.
+  invoke("overlay_ready", { nonce: shot.nonce }).catch(() => {});
 }
 
 function resetState() {
