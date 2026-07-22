@@ -908,7 +908,9 @@ impl RegionGrabber {
             return;
         }
         let (rw, rh) = ((cx1 - cx0) as u32, (cy1 - cy0) as u32);
-        let img = match mon.capture_region(cx0, cy0, rw, rh) {
+        // capture_region takes monitor-local u32 coords; cx0/cy0 are clamped
+        // to >= 0 above, so the casts are lossless.
+        let img = match mon.capture_region(cx0 as u32, cy0 as u32, rw, rh) {
             Ok(i) => i,
             Err(_) => {
                 self.mon = None;
