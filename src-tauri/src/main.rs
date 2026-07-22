@@ -4,10 +4,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -35,13 +34,24 @@ fn log_path() -> &'static PathBuf {
     })
 }
 
+// Cap the log so it can't grow without bound across months of uptime; one
+// previous generation is kept for post-mortems.
+const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
 fn log(msg: &str) {
     let line = format!(
         "[{}] {}\n",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
         msg
     );
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_path()) {
+    let path = log_path();
+    if fs::metadata(path).map(|m| m.len() > LOG_MAX_BYTES).unwrap_or(false) {
+        let old = path.with_extension("log.old");
+        // Windows rename refuses to overwrite; clear the target first.
+        let _ = fs::remove_file(&old);
+        let _ = fs::rename(path, &old);
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = f.write_all(line.as_bytes());
     }
     eprint!("{line}");
@@ -123,6 +133,12 @@ struct Recording {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
+
+// Count of capture threads still flushing their video file. stop_recording
+// detaches the thread (joining would freeze the UI), so quit must wait on this
+// counter instead of a JoinHandle or it kills ffmpeg mid-write and leaves a
+// corrupt mp4.
+static FINALIZING: AtomicU32 = AtomicU32::new(0);
 
 struct AppState {
     settings: Mutex<Settings>,
@@ -228,11 +244,54 @@ fn monitor_layout() -> Result<Vec<(i32, i32, u32, u32)>, String> {
     Ok(layout)
 }
 
+// Full-screen shot targets the monitor the cursor is on, so the hotkey shoots
+// the screen the user is actually working on; primary is only the fallback.
+fn full_capture_monitor() -> Result<xcap::Monitor, String> {
+    if let Some((cx, cy)) = cursor_pos() {
+        if let Ok(m) = xcap::Monitor::from_point(cx, cy) {
+            return Ok(m);
+        }
+    }
+    primary_monitor()
+}
+
 fn capture_full(dir: &PathBuf) -> Result<String, String> {
-    let monitor = primary_monitor()?;
-    let image = monitor
-        .capture_image()
-        .map_err(|e| format!("capture_image failed: {e}"))?;
+    // Same anti-glitch discipline the area capture has: a frame whose size
+    // disagrees with the monitor is the squeezed mid-re-init capture Windows
+    // hands out after wake/unlock. Retry until it settles; on the last attempt
+    // accept whatever we get rather than fail the hotkey outright.
+    const MAX_ATTEMPTS: u32 = 10;
+    let mut image = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let monitor = full_capture_monitor()?;
+        let (w, h) = (monitor.width().unwrap_or(0), monitor.height().unwrap_or(0));
+        match monitor.capture_image() {
+            Ok(img) => {
+                if attempt < MAX_ATTEMPTS
+                    && w != 0
+                    && h != 0
+                    && (img.width() != w || img.height() != h)
+                {
+                    log(&format!(
+                        "full capture came back {}x{} for a {w}x{h} monitor; retrying",
+                        img.width(),
+                        img.height()
+                    ));
+                } else {
+                    image = Some(img);
+                    break;
+                }
+            }
+            Err(e) => {
+                if attempt == MAX_ATTEMPTS {
+                    return Err(format!("capture_image failed: {e}"));
+                }
+                log(&format!("full capture failed ({e}); retrying"));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+    let image = image.ok_or_else(|| "no frame captured".to_string())?;
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let path = dir.join(timestamp_name());
     image
@@ -517,12 +576,34 @@ fn spawn_session_watcher() {
 #[cfg(not(windows))]
 fn spawn_session_watcher() {}
 
-fn decode_png_data_url(s: &str) -> Result<Vec<u8>, String> {
-    let data = s
-        .rsplit_once(",")
-        .map(|(_, b)| b)
-        .unwrap_or(s);
-    STANDARD.decode(data).map_err(|e| format!("base64 decode failed: {e}"))
+// The exported PNG arrives as a raw binary invoke body (Tauri v2), not a
+// base64 data URL: on a large selection the multi-MB base64 JSON string was
+// the save/copy latency culprit.
+fn request_png<'a>(request: &'a tauri::ipc::Request) -> Result<&'a [u8], String> {
+    match request.body() {
+        tauri::ipc::InvokeBody::Raw(b) => Ok(b.as_slice()),
+        _ => Err("expected binary png payload".into()),
+    }
+}
+
+// Minimal decodeURIComponent counterpart: filenames can be any unicode but
+// HTTP-style invoke headers cannot, so the overlay percent-encodes the name.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ---------- video recording ----------
@@ -636,72 +717,103 @@ fn draw_cursor(buf: &mut [u8], w: u32, h: u32, cx: i32, cy: i32) {
     }
 }
 
-// Copy the recorded screen region into `buf` as tightly-packed RGBA of exactly
-// w*h pixels. Anything outside the captured monitor stays black, so the frame
-// size never changes mid-recording (ffmpeg's raw input requires a fixed size).
-fn fill_region_frame(ax: i32, ay: i32, w: u32, h: u32, buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        *b = 0;
+// Per-recording capture source. Resolves the monitor under the region once and
+// then grabs ONLY the region rect each frame; the old path re-enumerated all
+// monitors and copied the whole screen 30-60 times a second, which is what made
+// recording eat CPU. Fills `buf` as tightly-packed RGBA of exactly w*h pixels;
+// anything outside the monitor stays black, so the frame size never changes
+// mid-recording (ffmpeg's raw input requires a fixed size). On any grab error
+// the cached monitor is dropped and re-resolved next frame, so a display change
+// mid-recording degrades to black frames instead of ending the video.
+struct RegionGrabber {
+    mon: Option<xcap::Monitor>,
+    ax: i32,
+    ay: i32,
+    w: u32,
+    h: u32,
+}
+
+impl RegionGrabber {
+    fn new(ax: i32, ay: i32, w: u32, h: u32) -> Self {
+        Self { mon: None, ax, ay, w, h }
     }
-    let monitors = match xcap::Monitor::all() {
-        Ok(m) => m,
-        Err(_) => return,
-    };
-    let cx = ax + (w as i32) / 2;
-    let cy = ay + (h as i32) / 2;
-    let mon = monitors.into_iter().find(|m| {
-        let mx = m.x().unwrap_or(0);
-        let my = m.y().unwrap_or(0);
-        let mw = m.width().unwrap_or(0) as i32;
-        let mh = m.height().unwrap_or(0) as i32;
-        cx >= mx && cx < mx + mw && cy >= my && cy < my + mh
-    });
-    let mon = match mon {
-        Some(m) => m,
-        None => return,
-    };
-    let mx = mon.x().unwrap_or(0);
-    let my = mon.y().unwrap_or(0);
-    let img = match mon.capture_image() {
-        Ok(i) => i,
-        Err(_) => return,
-    };
-    let iw = img.width() as i32;
-    let ih = img.height() as i32;
-    let raw = img.as_raw();
-    let ox = ax - mx; // source origin within this monitor
-    let oy = ay - my;
-    let c_start = 0.max(-ox);
-    let c_end = (w as i32).min(iw - ox);
-    if c_end <= c_start {
-        return;
-    }
-    let span = ((c_end - c_start) * 4) as usize;
-    for row in 0..h as i32 {
-        let sy = oy + row;
-        if sy < 0 || sy >= ih {
-            continue;
+
+    fn fill(&mut self, buf: &mut [u8]) {
+        for b in buf.iter_mut() {
+            *b = 0;
         }
-        let si = (((sy * iw) + (ox + c_start)) * 4) as usize;
-        let di = (((row * w as i32) + c_start) * 4) as usize;
-        buf[di..di + span].copy_from_slice(&raw[si..si + span]);
+        if self.mon.is_none() {
+            let cx = self.ax + (self.w as i32) / 2;
+            let cy = self.ay + (self.h as i32) / 2;
+            self.mon = xcap::Monitor::from_point(cx, cy).ok();
+        }
+        let mon = match &self.mon {
+            Some(m) => m,
+            None => return,
+        };
+        let mx = mon.x().unwrap_or(0);
+        let my = mon.y().unwrap_or(0);
+        let mw = mon.width().unwrap_or(0) as i32;
+        let mh = mon.height().unwrap_or(0) as i32;
+        // Region in monitor-local coordinates, clipped to the monitor.
+        let ox = self.ax - mx;
+        let oy = self.ay - my;
+        let cx0 = ox.max(0);
+        let cy0 = oy.max(0);
+        let cx1 = (ox + self.w as i32).min(mw);
+        let cy1 = (oy + self.h as i32).min(mh);
+        if cx1 <= cx0 || cy1 <= cy0 {
+            return;
+        }
+        let (rw, rh) = ((cx1 - cx0) as u32, (cy1 - cy0) as u32);
+        let img = match mon.capture_region(cx0, cy0, rw, rh) {
+            Ok(i) => i,
+            Err(_) => {
+                self.mon = None;
+                return;
+            }
+        };
+        if img.width() != rw || img.height() != rh {
+            self.mon = None;
+            return;
+        }
+        let raw = img.as_raw();
+        let dx = (cx0 - ox) as usize;
+        let dy = (cy0 - oy) as usize;
+        let span = rw as usize * 4;
+        for row in 0..rh as usize {
+            let si = row * span;
+            let di = ((dy + row) * self.w as usize + dx) * 4;
+            buf[di..di + span].copy_from_slice(&raw[si..si + span]);
+        }
     }
 }
 
 // ---------- windows ----------
 
+// Freezing the desktop can take a while right after wake (capture retries up
+// to ~1.2s), and the hotkey handler runs on the UI thread: grab on a worker
+// so the tray and windows never stall, and swallow repeat presses while a
+// grab is already in flight.
+static FREEZING: AtomicBool = AtomicBool::new(false);
+
 fn begin_area_capture(app: &AppHandle) {
-    match grab_frozen() {
-        Ok(shot) => {
-            *app.state::<AppState>().frozen.lock().unwrap() = Some(shot);
-            log("screen frozen for area capture");
-        }
-        Err(e) => {
-            log(&format!("freeze failed: {e}"));
-            return;
-        }
+    if FREEZING.swap(true, Ordering::SeqCst) {
+        log("area capture already in progress; ignoring re-trigger");
+        return;
     }
-    show_overlay(app);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        match grab_frozen() {
+            Ok(shot) => {
+                *app.state::<AppState>().frozen.lock().unwrap() = Some(shot);
+                log("screen frozen for area capture");
+                show_overlay(&app);
+            }
+            Err(e) => log(&format!("freeze failed: {e}")),
+        }
+        FREEZING.store(false, Ordering::SeqCst);
+    });
 }
 
 // Build the area-selection overlay once, hidden, at startup. Creating the
@@ -996,8 +1108,13 @@ fn get_frozen(state: State<AppState>) -> Option<FrozenInfo> {
 }
 
 #[tauri::command]
-fn save_capture(app: AppHandle, png_data_url: String, name: Option<String>) -> Result<String, String> {
-    let bytes = decode_png_data_url(&png_data_url)?;
+fn save_capture(app: AppHandle, request: tauri::ipc::Request) -> Result<String, String> {
+    let bytes = request_png(&request)?;
+    let name = request
+        .headers()
+        .get("x-name")
+        .and_then(|v| v.to_str().ok())
+        .map(percent_decode);
     let dir = resolve_save_dir(&app.state::<AppState>());
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let file_name = match name {
@@ -1005,7 +1122,7 @@ fn save_capture(app: AppHandle, png_data_url: String, name: Option<String>) -> R
         _ => timestamp_name(),
     };
     let path = dir.join(file_name);
-    fs::write(&path, &bytes).map_err(|e| format!("save failed: {e}"))?;
+    fs::write(&path, bytes).map_err(|e| format!("save failed: {e}"))?;
     let p = path.to_string_lossy().to_string();
     log(&format!("saved area screenshot: {p}"));
     hide_overlay(&app);
@@ -1013,9 +1130,9 @@ fn save_capture(app: AppHandle, png_data_url: String, name: Option<String>) -> R
 }
 
 #[tauri::command]
-fn copy_capture(app: AppHandle, png_data_url: String) -> Result<(), String> {
-    let bytes = decode_png_data_url(&png_data_url)?;
-    let img = image::load_from_memory(&bytes)
+fn copy_capture(app: AppHandle, request: tauri::ipc::Request) -> Result<(), String> {
+    let bytes = request_png(&request)?;
+    let img = image::load_from_memory(bytes)
         .map_err(|e| format!("decode failed: {e}"))?
         .to_rgba8();
     let (w, h) = (img.width() as usize, img.height() as usize);
@@ -1163,19 +1280,22 @@ fn start_recording(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_t = stop.clone();
     let app_t = app.clone();
+    // Incremented before spawn so quit can never race past a starting recording.
+    FINALIZING.fetch_add(1, Ordering::SeqCst);
     let handle = std::thread::spawn(move || {
         log("capture thread running");
         // Let the overlay actually disappear from the compositor first.
         std::thread::sleep(std::time::Duration::from_millis(300));
         let frame_bytes = (w as usize) * (h as usize) * 4;
         let mut buf = vec![0u8; frame_bytes];
+        let mut grabber = RegionGrabber::new(ax, ay, w, h);
         let interval = std::time::Duration::from_micros(1_000_000 / fps as u64);
         let start = std::time::Instant::now();
         let mut written: u64 = 0;
         let mut ffmpeg_died = false;
         while !stop_t.load(Ordering::Relaxed) {
             let tick_start = std::time::Instant::now();
-            fill_region_frame(ax, ay, w, h, &mut buf);
+            grabber.fill(&mut buf);
             if let Some((px, py)) = cursor_pos() {
                 draw_cursor(&mut buf, w, h, px - ax, py - ay);
             }
@@ -1231,6 +1351,7 @@ fn start_recording(
         } else {
             log(&format!("recording finished: {out_str} ({written} frames)"));
         }
+        FINALIZING.fetch_sub(1, Ordering::SeqCst);
     });
 
     *state.recording.lock().unwrap() = Some(Recording {
@@ -1309,6 +1430,21 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             "settings" => show_settings(app),
             "quit" => {
                 log("quit requested from tray");
+                // Finish an in-flight recording first so the file isn't left
+                // corrupt: signal stop, then wait for the capture thread(s) to
+                // flush ffmpeg (bounded: ffmpeg itself is killed after 15s).
+                let rec = app.state::<AppState>().recording.lock().unwrap().take();
+                if let Some(r) = rec {
+                    log("quit: stopping active recording");
+                    r.stop.store(true, Ordering::Relaxed);
+                }
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while FINALIZING.load(Ordering::SeqCst) > 0
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
                 std::process::exit(0);
             }
             _ => {}

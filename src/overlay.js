@@ -584,7 +584,7 @@ nameInput.addEventListener("keydown", (e) => {
   p.addEventListener("mousedown", (e) => e.stopPropagation())
 );
 
-function exportPNG() {
+function exportCanvas() {
   // Render the WHOLE screen at physical resolution first, then crop the
   // selection. The blur tool samples its own canvas (drawImage(canvas,...)),
   // so it needs the full frozen image present to sample from — a pre-cropped
@@ -606,15 +606,24 @@ function exportPNG() {
   ec.height = h;
   const ex = ec.getContext("2d");
   ex.drawImage(full, Math.round(sel.x * sx), Math.round(sel.y * sy), w, h, 0, 0, w, h);
-  return ec.toDataURL("image/png");
+  return ec;
+}
+
+// PNG as raw bytes for a binary invoke body. toBlob encodes off the main
+// thread and skips base64 entirely; on big selections the base64 data URL
+// through the JSON IPC bridge was what made Save/Copy feel slow.
+async function exportBytes() {
+  const ec = exportCanvas();
+  const blob = await new Promise((res) => ec.toBlob(res, "image/png"));
+  if (!blob) throw new Error("png encode failed");
+  return new Uint8Array(await blob.arrayBuffer());
 }
 
 async function doSave() {
   if (!sel) return;
   if (textInput) commitText();
   try {
-    const url = exportPNG();
-    await invoke("save_capture", { pngDataUrl: url });
+    await invoke("save_capture", await exportBytes());
     resetState();
   } catch (_) { /* keep editor open on failure */ }
 }
@@ -635,8 +644,11 @@ async function confirmNameSave() {
   const name = nameInput.value;
   closeNameModal();
   try {
-    const url = exportPNG();
-    await invoke("save_capture", { pngDataUrl: url, name });
+    // Filename travels as a header (body is the raw PNG); percent-encoded
+    // because headers can't carry arbitrary unicode.
+    await invoke("save_capture", await exportBytes(), {
+      headers: { "x-name": encodeURIComponent(name) },
+    });
     resetState();
   } catch (_) { /* keep editor open on failure */ }
 }
@@ -645,8 +657,7 @@ async function doCopy() {
   if (!sel) return;
   if (textInput) commitText();
   try {
-    const url = exportPNG();
-    await invoke("copy_capture", { pngDataUrl: url });
+    await invoke("copy_capture", await exportBytes());
     resetState();
   } catch (_) { /* keep editor open on failure */ }
 }
