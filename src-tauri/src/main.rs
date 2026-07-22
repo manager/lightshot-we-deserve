@@ -1076,8 +1076,9 @@ fn reveal_overlays(app: &AppHandle, nonce: u64, timeout: bool) {
 }
 
 fn show_overlay(app: &AppHandle) {
+    let state = app.state::<AppState>();
     let (nonce, geoms): (u64, Vec<(i32, i32, u32, u32)>) = {
-        let guard = app.state::<AppState>().frozen.lock().unwrap();
+        let guard = state.frozen.lock().unwrap();
         match guard.as_ref() {
             Some(f) => (
                 f.nonce,
