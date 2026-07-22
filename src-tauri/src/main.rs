@@ -284,7 +284,16 @@ fn grab_frozen_once(force: bool) -> Result<Option<Frozen>, String> {
                 }
                 placed.push((x, y, img));
             }
-            Err(e) => log(&format!("monitor capture failed at ({x},{y}): {e}")),
+            Err(e) => {
+                log(&format!("monitor capture failed at ({x},{y}): {e}"));
+                // Right after wake/unlock a monitor can refuse the grab while it
+                // re-initializes. Treat that like an unsettled layout so the
+                // caller retries, instead of silently shipping a composite with
+                // that screen missing.
+                if !force {
+                    return Ok(None);
+                }
+            }
         }
     }
     if placed.is_empty() {
@@ -365,12 +374,17 @@ fn grab_frozen() -> Result<Frozen, String> {
 // or re-attaching a monitor never worked. Watch the layout from a background
 // thread and take a throwaway capture as soon as it settles after a change, so
 // the init cost is paid right away instead of at the user's next hotkey press.
+//
+// Set to true whenever the capture path may have been invalidated. Starts true
+// because the very first capture of a session pays the same init cost. Written
+// by the layout poll below AND by the session watcher (lock/unlock and sleep
+// resume invalidate capture without moving the layout, so polling alone never
+// notices those).
+static WARM_PENDING: AtomicBool = AtomicBool::new(true);
+
 fn spawn_display_watcher(app: AppHandle) {
     std::thread::spawn(move || {
         let mut last = monitor_layout().unwrap_or_default();
-        // Startup counts too: the very first capture of a session pays the same
-        // init cost, so warm up once immediately.
-        let mut pending = true;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(1000));
             let now = match monitor_layout() {
@@ -379,24 +393,129 @@ fn spawn_display_watcher(app: AppHandle) {
             };
             if now != last {
                 last = now;
-                pending = true;
+                WARM_PENDING.store(true, Ordering::SeqCst);
                 continue; // still moving — warm up only after two reads agree
             }
-            if pending {
+            if WARM_PENDING.load(Ordering::SeqCst) {
                 // A full-desktop grab mid-recording could hiccup the video;
                 // leave it pending and retry after the recording ends.
                 if app.state::<AppState>().recording.lock().unwrap().is_some() {
                     continue;
                 }
-                pending = false;
                 match grab_frozen_once(true) {
-                    Ok(_) => log("display warm-up capture done"),
+                    Ok(_) => {
+                        WARM_PENDING.store(false, Ordering::SeqCst);
+                        log("display warm-up capture done");
+                    }
+                    // The display may still be down (mid-resume); keep the flag
+                    // set and retry on the next tick.
                     Err(e) => log(&format!("display warm-up capture failed: {e}")),
                 }
             }
         }
     });
 }
+
+// Locking the session (Win+L), unlocking it, and sleep/resume all tear down the
+// OS capture path WITHOUT changing the monitor layout, so the geometry poll in
+// spawn_display_watcher never notices them. The next hotkey capture then pays
+// the display re-init: the visible full-screen "squeeze" glitch. A hidden
+// window subscribed to session and power broadcasts flags a warm-up instead, so
+// the re-init happens right at unlock/resume where the screen is transitioning
+// anyway, not at the user's next screenshot.
+#[cfg(windows)]
+fn spawn_session_watcher() {
+    std::thread::spawn(|| unsafe {
+        use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::System::RemoteDesktop::WTSRegisterSessionNotification;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
+            TranslateMessage, MSG, WM_POWERBROADCAST, WNDCLASSW,
+        };
+
+        unsafe extern "system" fn wnd_proc(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+        ) -> LRESULT {
+            const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+            const WTS_CONSOLE_CONNECT: WPARAM = 0x1;
+            const WTS_SESSION_UNLOCK: WPARAM = 0x8;
+            const PBT_APMRESUMESUSPEND: WPARAM = 0x7;
+            const PBT_APMRESUMEAUTOMATIC: WPARAM = 0x12;
+            match msg {
+                WM_WTSSESSION_CHANGE
+                    if wp == WTS_SESSION_UNLOCK || wp == WTS_CONSOLE_CONNECT =>
+                {
+                    log("session unlocked; scheduling display warm-up");
+                    WARM_PENDING.store(true, Ordering::SeqCst);
+                    0
+                }
+                WM_POWERBROADCAST
+                    if wp == PBT_APMRESUMESUSPEND || wp == PBT_APMRESUMEAUTOMATIC =>
+                {
+                    log("resumed from sleep; scheduling display warm-up");
+                    WARM_PENDING.store(true, Ordering::SeqCst);
+                    1
+                }
+                _ => DefWindowProcW(hwnd, msg, wp, lp),
+            }
+        }
+
+        let class_name: Vec<u16> = "lwd-session-watch\0".encode_utf16().collect();
+        let hinstance = GetModuleHandleW(std::ptr::null());
+        let wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance,
+            hIcon: std::ptr::null_mut(),
+            hCursor: std::ptr::null_mut(),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class_name.as_ptr(),
+        };
+        if RegisterClassW(&wc) == 0 {
+            log("session watcher: RegisterClassW failed");
+            return;
+        }
+        // A real (hidden) top-level window, not a message-only one: broadcasts
+        // like WM_POWERBROADCAST are never delivered to message-only windows.
+        let hwnd = CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            class_name.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            hinstance,
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            log("session watcher: CreateWindowExW failed");
+            return;
+        }
+        // NOTIFY_FOR_THIS_SESSION: lock/unlock of our own session only.
+        if WTSRegisterSessionNotification(hwnd, 0) == 0 {
+            log("session watcher: WTSRegisterSessionNotification failed");
+        }
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn spawn_session_watcher() {}
 
 fn decode_png_data_url(s: &str) -> Result<Vec<u8>, String> {
     let data = s
@@ -1301,6 +1420,7 @@ fn run() {
             create_indicator_windows(&handle);
             create_overlay_window(&handle);
             spawn_display_watcher(handle.clone());
+            spawn_session_watcher();
             log("setup complete");
             Ok(())
         })
