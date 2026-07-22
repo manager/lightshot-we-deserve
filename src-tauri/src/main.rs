@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -117,6 +117,11 @@ fn store_settings(s: &Settings) -> Result<(), String> {
 // PNG compression pass entirely — lossless and faster to encode.
 struct Frozen {
     bytes: Vec<u8>,
+    // Virtual-desktop origin of the shot. The overlay is positioned from THESE
+    // coordinates, not from a fresh monitor query: if the layout changed
+    // between grab and show, stretching the image to new bounds garbles it.
+    x: i32,
+    y: i32,
     width: u32,
     height: u32,
     nonce: u64,
@@ -256,6 +261,8 @@ fn full_capture_monitor() -> Result<xcap::Monitor, String> {
 }
 
 fn capture_full(dir: &PathBuf) -> Result<String, String> {
+    let _guard = CAPTURE_LOCK.lock().unwrap();
+    warm_up_if_dirty("full capture");
     // Same anti-glitch discipline the area capture has: a frame whose size
     // disagrees with the monitor is the squeezed mid-re-init capture Windows
     // hands out after wake/unlock. Retry until it settles; on the last attempt
@@ -332,7 +339,10 @@ fn grab_frozen_once(force: bool) -> Result<Option<Frozen>, String> {
                 // A frame whose size disagrees with what the monitor reports is
                 // the "squeezed" capture Windows hands out while the display is
                 // still re-initializing after wake/dock — reject the attempt so
-                // the caller retries once it settles.
+                // the caller retries once it settles. NOTE: on the GDI path
+                // (our build) BitBlt always returns the requested size, so this
+                // check can never fire there; the event-driven dirty/clean
+                // generations above are the real staleness defense.
                 if !force && w != 0 && h != 0 && (img.width() != w || img.height() != h) {
                     log(&format!(
                         "monitor at ({x},{y}) reports {w}x{h} but frame is {}x{}; unsettled",
@@ -396,13 +406,54 @@ fn grab_frozen_once(force: bool) -> Result<Option<Frozen>, String> {
     log(&format!("frozen virtual desktop {vw}x{vh} at ({min_x},{min_y})"));
     Ok(Some(Frozen {
         bytes: buf.into_inner(),
+        x: min_x,
+        y: min_y,
         width: vw,
         height: vh,
         nonce: next_nonce(),
     }))
 }
 
+// Display "generation" counters. Anything that can invalidate the OS capture
+// path (unlock, sleep resume, display change, layout move) bumps DIRTY_GEN;
+// a successful warm-up records which generation it cleaned. On the GDI path a
+// stale first frame LOOKS valid (BitBlt always returns the requested size), so
+// staleness can only be tracked by events, never detected from the frame; and
+// a plain boolean would lose an event that arrives mid-warm-up.
+static DIRTY_GEN: AtomicU64 = AtomicU64::new(1); // session start counts as dirty
+static CLEAN_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn mark_display_dirty(why: &str) {
+    DIRTY_GEN.fetch_add(1, Ordering::SeqCst);
+    log(&format!("display marked dirty: {why}"));
+}
+
+// Serializes all still captures (background warm-up vs user screenshots) so
+// they never interleave. Recording frames don't take it: the watcher already
+// stays off the screen while a recording runs.
+static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+// If the display changed since the last known-good capture, take one throwaway
+// full grab so the visible re-init "squeeze" and the stale frame are burned
+// here, and the caller's real capture is already the clean second frame.
+// Call with CAPTURE_LOCK held.
+fn warm_up_if_dirty(context: &str) {
+    let dirty = DIRTY_GEN.load(Ordering::SeqCst);
+    if CLEAN_GEN.load(Ordering::SeqCst) >= dirty {
+        return;
+    }
+    log(&format!("{context}: display dirty; taking a throwaway warm-up frame"));
+    match grab_frozen_once(true) {
+        // Store the generation read BEFORE the grab: an event that lands
+        // mid-grab keeps the display dirty instead of being lost.
+        Ok(_) => CLEAN_GEN.store(dirty, Ordering::SeqCst),
+        Err(e) => log(&format!("warm-up frame failed: {e}")),
+    }
+}
+
 fn grab_frozen() -> Result<Frozen, String> {
+    let _guard = CAPTURE_LOCK.lock().unwrap();
+    warm_up_if_dirty("area capture");
     // After waking from sleep or (re)attaching a dock, Windows reports a shifting
     // monitor layout for up to ~1s; a capture taken then looks "caught mid-resize".
     // Retry until the layout reads stable, then fall back to a forced grab so a
@@ -433,17 +484,17 @@ fn grab_frozen() -> Result<Frozen, String> {
 // or re-attaching a monitor never worked. Watch the layout from a background
 // thread and take a throwaway capture as soon as it settles after a change, so
 // the init cost is paid right away instead of at the user's next hotkey press.
-//
-// Set to true whenever the capture path may have been invalidated. Starts true
-// because the very first capture of a session pays the same init cost. Written
-// by the layout poll below AND by the session watcher (lock/unlock and sleep
-// resume invalidate capture without moving the layout, so polling alone never
-// notices those).
-static WARM_PENDING: AtomicBool = AtomicBool::new(true);
-
+// The hotkey paths warm up on demand (warm_up_if_dirty), so this watcher is
+// the background half: it notices layout changes the event window can't see,
+// and pays the warm-up cost during idle time so the user's next hotkey press
+// usually doesn't have to.
 fn spawn_display_watcher(app: AppHandle) {
     std::thread::spawn(move || {
         let mut last = monitor_layout().unwrap_or_default();
+        // Consecutive failed warm-ups. After a few, fall back to a forced grab
+        // and call it clean, otherwise one permanently uncapturable monitor
+        // would make every future screenshot pay a throwaway frame.
+        let mut fails: u32 = 0;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(1000));
             let now = match monitor_layout() {
@@ -452,23 +503,36 @@ fn spawn_display_watcher(app: AppHandle) {
             };
             if now != last {
                 last = now;
-                WARM_PENDING.store(true, Ordering::SeqCst);
+                mark_display_dirty("monitor layout changed");
                 continue; // still moving — warm up only after two reads agree
             }
-            if WARM_PENDING.load(Ordering::SeqCst) {
-                // A full-desktop grab mid-recording could hiccup the video;
-                // leave it pending and retry after the recording ends.
-                if app.state::<AppState>().recording.lock().unwrap().is_some() {
-                    continue;
+            let dirty = DIRTY_GEN.load(Ordering::SeqCst);
+            if CLEAN_GEN.load(Ordering::SeqCst) >= dirty {
+                fails = 0;
+                continue;
+            }
+            // A full-desktop grab mid-recording could hiccup the video;
+            // leave it dirty and retry after the recording ends.
+            if app.state::<AppState>().recording.lock().unwrap().is_some() {
+                continue;
+            }
+            let _guard = CAPTURE_LOCK.lock().unwrap();
+            // Non-forced first: it refuses partial results (a monitor that
+            // failed to grab), which must stay dirty rather than count as
+            // warmed. The generation stored is the one read BEFORE grabbing.
+            match grab_frozen_once(fails >= 5) {
+                Ok(Some(_)) => {
+                    CLEAN_GEN.store(dirty, Ordering::SeqCst);
+                    fails = 0;
+                    log("display warm-up capture done");
                 }
-                match grab_frozen_once(true) {
-                    Ok(_) => {
-                        WARM_PENDING.store(false, Ordering::SeqCst);
-                        log("display warm-up capture done");
-                    }
-                    // The display may still be down (mid-resume); keep the flag
-                    // set and retry on the next tick.
-                    Err(e) => log(&format!("display warm-up capture failed: {e}")),
+                Ok(None) => {
+                    fails += 1;
+                    log("display warm-up unsettled; will retry");
+                }
+                Err(e) => {
+                    fails += 1;
+                    log(&format!("display warm-up capture failed: {e}"));
                 }
             }
         }
@@ -490,7 +554,7 @@ fn spawn_session_watcher() {
         use windows_sys::Win32::System::RemoteDesktop::WTSRegisterSessionNotification;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
-            TranslateMessage, MSG, WM_POWERBROADCAST, WNDCLASSW,
+            TranslateMessage, MSG, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WNDCLASSW,
         };
 
         unsafe extern "system" fn wnd_proc(
@@ -508,16 +572,21 @@ fn spawn_session_watcher() {
                 WM_WTSSESSION_CHANGE
                     if wp == WTS_SESSION_UNLOCK || wp == WTS_CONSOLE_CONNECT =>
                 {
-                    log("session unlocked; scheduling display warm-up");
-                    WARM_PENDING.store(true, Ordering::SeqCst);
+                    mark_display_dirty("session unlocked");
                     0
                 }
                 WM_POWERBROADCAST
                     if wp == PBT_APMRESUMESUSPEND || wp == PBT_APMRESUMEAUTOMATIC =>
                 {
-                    log("resumed from sleep; scheduling display warm-up");
-                    WARM_PENDING.store(true, Ordering::SeqCst);
+                    mark_display_dirty("resumed from sleep");
                     1
+                }
+                // Resolution / display count / re-plug of a monitor. Also
+                // covers an HDMI swap that ends up with the SAME geometry,
+                // which the layout poll can never distinguish.
+                WM_DISPLAYCHANGE => {
+                    mark_display_dirty("display change broadcast");
+                    0
                 }
                 _ => DefWindowProcW(hwnd, msg, wp, lp),
             }
@@ -841,8 +910,23 @@ fn create_overlay_window(app: &AppHandle) {
 }
 
 fn show_overlay(app: &AppHandle) {
+    // Position from the frozen shot itself, not a fresh monitor query: if the
+    // layout changed between grab and show, sizing the window to the NEW
+    // bounds would stretch the old image across them.
+    let geom = app
+        .state::<AppState>()
+        .frozen
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|f| (f.x, f.y, f.width, f.height));
+    let geom = match geom {
+        Some(g) => Ok(g),
+        None => virtual_bounds(), // no frozen shot (shouldn't happen); best effort
+    };
     if let Some(w) = app.get_webview_window("overlay") {
-        if let Ok((x, y, vw, vh)) = virtual_bounds() {
+        // Borrow, not move: the fallback branch below still needs `geom`.
+        if let Ok(&(x, y, vw, vh)) = geom.as_ref() {
             let _ = w.set_position(PhysicalPosition::new(x, y));
             let _ = w.set_size(PhysicalSize::new(vw, vh));
         }
@@ -866,12 +950,12 @@ fn show_overlay(app: &AppHandle) {
             .build()
         {
             Ok(win) => {
-                match virtual_bounds() {
+                match geom {
                     Ok((x, y, w, h)) => {
                         let _ = win.set_position(PhysicalPosition::new(x, y));
                         let _ = win.set_size(PhysicalSize::new(w, h));
                     }
-                    Err(e) => log(&format!("virtual_bounds failed: {e}")),
+                    Err(e) => log(&format!("overlay geometry unavailable: {e}")),
                 }
                 // Built hidden; JS reveals it via `overlay_ready` once the
                 // frozen frame is painted, so dim + crosshair appear together.
